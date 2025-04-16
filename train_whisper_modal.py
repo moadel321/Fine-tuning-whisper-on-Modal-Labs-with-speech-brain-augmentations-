@@ -1,4 +1,12 @@
 import logging
+import yaml  # Add yaml import
+import tempfile  # Add tempfile for safe temporary file handling
+import csv  # Add csv import for augmentation file handling
+import shutil  # For cleanup
+import math
+import torch.nn.functional as F
+from speechbrain.processing.signal_processing import compute_amplitude, dB_to_amplitude, reverberate
+from datasets import load_dataset  # Global import for dataset loading in Brain
 
 # Full Corrected Script V4 (Fix SimpleNamespace error, Add Gradient Clipping)
 
@@ -275,7 +283,7 @@ print("Data Loading Pipelines defined.")
 # End of Cell 3
 
 
-# Cell 4: Define Brain Subclass (Using getattr for hparams, gradient clipping in fit_batch)
+# Cell 4: Define Brain Subclass (Modified Augmentation Initialization)
 
 import speechbrain as sb
 from speechbrain.utils.metric_stats import ErrorRateStats
@@ -287,6 +295,113 @@ import string
 import torch
 import torch.nn.utils.rnn as rnn_utils
 import math
+
+# --- Wrapper Augmentation Modules (placed before Brain class for visibility) ---
+
+class NoiseSampler(torch.nn.Module):
+    """Applies noise by sampling directly from an HF dataset object."""
+    def __init__(self, noise_dataset, snr_low=0, snr_high=0, target_sample_rate=16000, normalize=False):
+        super().__init__()
+        self.noise_dataset = noise_dataset
+        self.num_noises = len(noise_dataset) if noise_dataset is not None else 0
+        self.snr_low = snr_low
+        self.snr_high = snr_high
+        self.target_sample_rate = target_sample_rate
+        self.normalize = normalize
+
+    def forward(self, waveforms, lengths):
+        if self.num_noises == 0:
+            return waveforms
+
+        batch_size, max_len = waveforms.shape[0], waveforms.shape[1]
+        abs_lengths = (lengths * max_len).long().squeeze(1) if lengths.dim() == 2 else (lengths * max_len).long()
+
+        clean_amp = compute_amplitude(waveforms, abs_lengths.unsqueeze(1), amp_type="rms")
+        SNR = torch.rand(batch_size, 1, device=waveforms.device) * (self.snr_high - self.snr_low) + self.snr_low
+        noise_factor = 1 / (dB_to_amplitude(SNR) + 1)
+        if waveforms.dim() == 3:
+            noise_factor = noise_factor.unsqueeze(1)
+
+        new_noise_amp = noise_factor * clean_amp
+        noisy_waveform = waveforms * (1 - noise_factor)
+
+        processed = []
+        for i in range(batch_size):
+            try:
+                idx = random.randint(0, self.num_noises - 1)
+                item = self.noise_dataset[idx]["audio"]
+                noise_wav = torch.tensor(item["array"], device=waveforms.device).float()
+                sr = item["sampling_rate"]
+                if sr != self.target_sample_rate:
+                    noise_wav = torchaudio.functional.resample(noise_wav, sr, self.target_sample_rate)
+
+                tgt_len = abs_lengths[i].item()
+                cur_len = noise_wav.shape[-1]
+                if cur_len > tgt_len:
+                    start = random.randint(0, cur_len - tgt_len)
+                    noise_wav = noise_wav[..., start:start+tgt_len]
+                elif cur_len < tgt_len:
+                    noise_wav = torch.nn.functional.pad(noise_wav, (0, tgt_len - cur_len))
+
+                orig_amp = compute_amplitude(noise_wav.unsqueeze(0), torch.tensor([noise_wav.numel()], device=waveforms.device), amp_type="rms")
+                noise_wav = noise_wav * new_noise_amp[i] / (orig_amp + 1e-14)
+
+                if noise_wav.shape[-1] < max_len:
+                    noise_wav = torch.nn.functional.pad(noise_wav, (0, max_len - noise_wav.shape[-1]))
+
+                processed.append(noise_wav)
+            except Exception as e:
+                logging.warning(f"NoiseSampler error on sample {i}: {e}")
+                processed.append(torch.zeros(max_len, device=waveforms.device))
+
+        noise_batch = torch.stack(processed, dim=0)
+        noisy_waveform = noisy_waveform + noise_batch
+
+        if self.normalize:
+            abs_max, _ = torch.max(torch.abs(noisy_waveform), dim=1, keepdim=True)
+            noisy_waveform = noisy_waveform / abs_max.clamp(min=1.0)
+
+        return noisy_waveform
+
+
+class RIRSampler(torch.nn.Module):
+    """Applies reverberation by sampling RIRs directly from an HF dataset object."""
+    def __init__(self, rir_dataset, target_sample_rate=16000, rir_scale_factor=1.0):
+        super().__init__()
+        self.rir_dataset = rir_dataset
+        self.num_rirs = len(rir_dataset) if rir_dataset is not None else 0
+        self.target_sample_rate = target_sample_rate
+        self.rir_scale_factor = rir_scale_factor
+        self.max_len = int(3.0 * target_sample_rate)
+
+    def forward(self, waveforms):
+        if self.num_rirs == 0:
+            return waveforms
+
+        channel_added = False
+        if waveforms.dim() == 2:
+            waveforms = waveforms.unsqueeze(-1)
+            channel_added = True
+
+        idx = random.randint(0, self.num_rirs - 1)
+        item = self.rir_dataset[idx]["audio"]
+        rir = torch.tensor(item["array"], device=waveforms.device).float()
+        sr = item["sampling_rate"]
+        if sr != self.target_sample_rate:
+            rir = torchaudio.functional.resample(rir, sr, self.target_sample_rate)
+
+        if rir.dim() == 1:
+            rir = rir.unsqueeze(-1)
+
+        if rir.shape[0] > self.max_len:
+            rir = rir[:self.max_len, :]
+
+        if self.rir_scale_factor != 1:
+            rir = F.interpolate(rir.transpose(0,1).unsqueeze(0), scale_factor=self.rir_scale_factor, mode="linear", align_corners=False).squeeze(0).transpose(0,1)
+
+        rev = reverberate(waveforms, rir, rescale_amp="avg")
+        return rev.squeeze(-1) if channel_added else rev
+
 
 print("Defining WhisperFineTuneBrain...")
 
@@ -333,80 +448,125 @@ class WhisperFineTuneBrain(sb.Brain):
 
         self.augmenter = None
         initialized_augmentations = []
+
+        # Create temporary directory for CSV files
+        temp_dir = tempfile.mkdtemp()
+        noise_csv_path = os.path.join(temp_dir, "noise_augment.csv")
+        rir_csv_path = os.path.join(temp_dir, "rir_augment.csv")
+        self._temp_dir = temp_dir  # Store for cleanup
+
         # ***** Use getattr for hparams access *****
         if getattr(self.hparams, "augment", False):
-            sb_augmentations = []
+            sb_augmentations = []  # List to hold augmenter instances
+
             target_sr = getattr(self.hparams, "target_sample_rate", TARGET_SAMPLE_RATE)
 
-            # --- Initialize AddNoise ---
-            noise_paths = getattr(self.hparams, "noise_paths", None)
-            if getattr(self.hparams, "noise_dataset_id", None) and noise_paths and isinstance(noise_paths, list) and len(noise_paths) > 0:
+            # --- Load Noise/RIR Dataset Objects ---
+            hparams["noise_dataset_object"] = None
+            hparams["rir_dataset_object"] = None
+            if hparams.get("augment", False):
                 try:
-                    logging.info(f"Attempting to initialize AddNoise with {len(noise_paths)} files using 'noise_paths' argument.")
-                    noise_adder = AddNoise(
-                        noise_paths=noise_paths, # Correct parameter name for SpeechBrain's AddNoise
+                     noise_ds_id = hparams.get("noise_dataset_id")
+                     if noise_ds_id:
+                          logging.info(f"Loading noise dataset object: {noise_ds_id}")
+                          try:
+                               noise_ds = load_dataset(noise_ds_id, cache_dir=CACHE_DIR, split="train")
+                               hparams["noise_dataset_object"] = noise_ds
+                               logging.info(f"Loaded noise dataset object with {len(noise_ds)} samples.")
+                          except Exception as e_noise_load: logging.warning(f"Could not load noise dataset object {noise_ds_id}: {e_noise_load}")
+
+                     rir_ds_id = hparams.get("rir_dataset_id")
+                     if rir_ds_id:
+                          logging.info(f"Loading RIR dataset object: {rir_ds_id}")
+                          try:
+                               rir_ds = load_dataset(rir_ds_id, cache_dir=CACHE_DIR, split="train")
+                               hparams["rir_dataset_object"] = rir_ds
+                               logging.info(f"Loaded RIR dataset object with {len(rir_ds)} samples.")
+                          except Exception as e_rir_load: logging.warning(f"Could not load RIR dataset object {rir_ds_id}: {e_rir_load}")
+                except Exception as e: logging.warning(f"General error loading noise/RIR dataset objects: {e}.")
+            else: logging.info("Skipping noise/RIR dataset loading as augmentation is disabled.")
+
+            # --- Initialize NoiseSampler using dataset object ---
+            noise_dataset = getattr(self.hparams, "noise_dataset_object", None)
+            noise_prob = getattr(self.hparams, "noise_prob", 0.0)
+            if noise_prob > 0 and noise_dataset is not None:
+                try:
+                    noise_sampler = NoiseSampler(
+                        noise_dataset=noise_dataset,
                         snr_low=self.hparams.noise_snr_low,
                         snr_high=self.hparams.noise_snr_high,
-                        noise_sample_rate=target_sr,
-                        clean_sample_rate=target_sr
+                        target_sample_rate=target_sr
                     )
-                    sb_augmentations.append(noise_adder)
-                    initialized_augmentations.append("AddNoise")
-                except AttributeError as e: logging.warning(f"Missing hparam attribute for AddNoise: {e}. Skipping.")
-                except TypeError as e: logging.warning(f"TypeError initializing AddNoise (likely wrong keyword arg?): {e}. Skipping.")
-                except Exception as e: logging.warning(f"Could not initialize AddNoise: {e}. Skipping.")
-            elif not noise_paths or not isinstance(noise_paths, list) or len(noise_paths) == 0:
-                 logging.info("Skipping AddNoise: 'noise_paths' is empty, not found, or not a list in hparams.")
+                    sb_augmentations.append(noise_sampler)
+                    initialized_augmentations.append("NoiseSampler")
+                except Exception as e:
+                    logging.warning(f"Could not initialize NoiseSampler: {e}. Skipping.", exc_info=True)
 
-            # --- Initialize AddReverb ---
-            rir_paths = getattr(self.hparams, "rir_paths", None)
-            if getattr(self.hparams, "rir_dataset_id", None) and rir_paths and isinstance(rir_paths, list) and len(rir_paths) > 0:
-                 try:
-                     logging.info(f"Attempting to initialize AddReverb with {len(rir_paths)} files using 'rir_paths' argument.")
-                     reverb_adder = AddReverb(
-                         rir_paths=rir_paths, # Correct parameter name for SpeechBrain's AddReverb
-                         rir_sample_rate=target_sr,
-                         clean_sample_rate=target_sr
-                     )
-                     sb_augmentations.append(reverb_adder)
-                     initialized_augmentations.append("AddReverb")
-                 except AttributeError as e: logging.warning(f"Missing hparam attribute for AddReverb: {e}. Skipping.")
-                 except TypeError as e: logging.warning(f"TypeError initializing AddReverb (likely wrong keyword arg?): {e}. Skipping.")
-                 except Exception as e: logging.warning(f"Could not initialize AddReverb: {e}. Skipping.")
-            elif not rir_paths or not isinstance(rir_paths, list) or len(rir_paths) == 0:
-                 logging.info("Skipping AddReverb: 'rir_paths' is empty, not found, or not a list in hparams.")
+            # --- Initialize RIRSampler using dataset object ---
+            rir_dataset = getattr(self.hparams, "rir_dataset_object", None)
+            reverb_prob = getattr(self.hparams, "reverb_prob", 0.0)
+            if reverb_prob > 0 and rir_dataset is not None:
+                try:
+                    reverb_sampler = RIRSampler(
+                        rir_dataset=rir_dataset,
+                        rir_scale_factor=1.0,
+                        target_sample_rate=target_sr
+                    )
+                    sb_augmentations.append(reverb_sampler)
+                    initialized_augmentations.append("RIRSampler")
+                except Exception as e:
+                    logging.warning(f"Could not initialize RIRSampler: {e}. Skipping.", exc_info=True)
 
             # --- Initialize SpeedPerturb ---
-            if hasattr(self.hparams, "speed_factors"):
-                 try:
-                     speeds = [factor / 100.0 for factor in self.hparams.speed_factors]
-                     speed_perturber = SpeedPerturb(orig_freq=target_sr, speeds=speeds)
-                     sb_augmentations.append(speed_perturber)
-                     initialized_augmentations.append("SpeedPerturb")
-                 except AttributeError as e: logging.warning(f"Missing hparam attribute for SpeedPerturb: {e}. Skipping.")
-                 except Exception as e: logging.warning(f"Could not initialize SpeedPerturb: {e}. Skipping.")
+            speed_prob = getattr(self.hparams, "speed_prob", 0.0)  # Get probability but don't use it
+            if speed_prob > 0 and hasattr(self.hparams, "speed_factors"):
+                try:
+                    speeds = [factor / 100.0 for factor in self.hparams.speed_factors]
+                    # Initialize WITHOUT perturb_prob (will use default 1.0)
+                    speed_perturber = SpeedPerturb(
+                        orig_freq=target_sr,
+                        speeds=speeds,
+                        device=self.device  # Added device parameter
+                    )
+                    sb_augmentations.append(speed_perturber)
+                    initialized_augmentations.append("SpeedPerturb")
+                except Exception as e:
+                    logging.warning(f"Could not initialize SpeedPerturb: {e}. Skipping.", exc_info=True)
 
+            # --- Initialize Augmenter (WITHOUT probs argument) ---
             if sb_augmentations:
                 try:
+                    # Initialize based on Augmenter source code (NO probs argument)
                     self.augmenter = Augmenter(
                         parallel_augment=False,
                         concat_original=False,
                         min_augmentations=getattr(self.hparams, "min_augmentations", 1),
                         max_augmentations=getattr(self.hparams, "max_augmentations", len(sb_augmentations)),
                         shuffle_augmentations=True,
-                        augmentations=sb_augmentations
+                        augment_prob=1.0,
+                        augmentations=sb_augmentations, # Pass list of sampler/perturber objects
                     )
-                    logging.info(f"SpeechBrain Augmenter initialized with: {', '.join(initialized_augmentations)}")
-                except AttributeError as e: logging.warning(f"Missing hparam attribute for Augmenter setup: {e}. Not initialized.")
-                except Exception as e: logging.warning(f"Could not initialize main Augmenter: {e}. Not initialized.")
-                if not self.augmenter: initialized_augmentations = [] # Reset if Augmenter failed
+                    aug_names = [type(aug).__name__ for aug in sb_augmentations]
+                    logging.info(f"SpeechBrain Augmenter initialized with: {', '.join(aug_names)}")
+                except Exception as e:
+                    logging.warning(f"Could not initialize main Augmenter: {e}. Not initialized.", exc_info=True)
+                    self.augmenter = None
+                    initialized_augmentations = []
             else:
-                 logging.info("No valid SpeechBrain augmentations configured or initialized.")
+                logging.info("No SpeechBrain augmentations were added.")
         else:
             logging.info("Data augmentation disabled via hparams.")
 
+    def __del__(self):
+        """Clean up temporary files when the object is destroyed."""
+        try:
+            if hasattr(self, '_temp_dir') and os.path.exists(self._temp_dir):
+                shutil.rmtree(self._temp_dir)
+                logging.info(f"Cleaned up temporary directory: {self._temp_dir}")
+        except Exception as e:
+            logging.warning(f"Error cleaning up temporary files: {e}")
 
-    # --- _preprocess_batch (Using getattr for hparams access) ---
+    # --- _preprocess_batch (Apply Augmenter Batch-wise) ---
     def _preprocess_batch(self, batch, stage):
         """Applies augmentations and tokenization to the raw batch data."""
         try:
@@ -414,125 +574,85 @@ class WhisperFineTuneBrain(sb.Brain):
             if not isinstance(batch.signal_raw, (list, tuple)) or len(batch.signal_raw) != 2:
                  logging.error(f"Unexpected batch.signal_raw format: {type(batch.signal_raw)}")
                  raise ValueError("Invalid batch.signal_raw format")
-            signals, signal_lens = batch.signal_raw
 
-            texts = batch.text_raw
+            # Get original signals and lengths (relative)
+            signals, signal_lens = batch.signal_raw
+            ids = getattr(batch, 'id', [f'no_id_{i}' for i in range(signals.shape[0])])
+            texts = batch.text_raw # Keep original texts for tokenization later
             if not isinstance(texts, list):
                  texts = [str(t) for t in texts] if hasattr(texts, '__iter__') else [str(texts)]
-            ids = getattr(batch, 'id', [f'no_id_{i}' for i in range(signals.shape[0])])
 
-            wavs = signals
-            wav_lens = signal_lens
+            wavs = signals  # Start with original signals
+            wav_lens = signal_lens # Start with original relative lengths
 
-            # ***** Use getattr for hparams access *****
-            if stage == sb.Stage.TRAIN and getattr(self.hparams, "augment", False):
-                proc_signals = []
-                original_lengths = []
+            # ***** Apply SpeechBrain Augmenter to the whole batch *****
+            if stage == sb.Stage.TRAIN and getattr(self.hparams, "augment", False) and self.augmenter is not None:
+                try:
+                    # Note: Augmenter expects [batch, time, channels] or [batch, time]
+                    # Ensure signals has the right shape if needed (might need unsqueeze/squeeze later)
+                    # Pass the relative lengths tensor directly
+                    wavs, wav_lens = self.augmenter(wavs, wav_lens)
+                    logging.debug("Applied SpeechBrain Augmenter to batch.") # Optional debug log
 
-                for i in range(signals.shape[0]):
-                     current_sig = signals[i]
-                     current_id = ids[i]
-                     current_len_abs = int(signal_lens[i].item() * current_sig.shape[0]) if signal_lens[i].item() > 0 and current_sig.dim() > 0 and current_sig.shape[0] > 0 else 0
+                except Exception as aug_e:
+                    logging.warning(f"Batch Augmentation failed: {aug_e}. Using original batch.", exc_info=True)
+                    wavs = signals # Revert to original if augmentation fails
+                    wav_lens = signal_lens
 
-                     if current_len_abs <= 0:
-                          logging.warning(f"Skipping augmentation for zero-length signal in batch id {current_id}")
-                          proc_signals.append(torch.tensor([], device=self.device))
-                          original_lengths.append(0)
-                          continue
+            # ***** Temporarily disable manual per-sample augmentations *****
+            # if stage == sb.Stage.TRAIN and getattr(self.hparams, "augment", False):
+            #     proc_signals = []
+            #     original_lengths = []
+            #     for i in range(signals.shape[0]):
+            #          current_sig = signals[i]
+            #          current_id = ids[i]
+            #          current_len_abs = int(signal_lens[i].item() * current_sig.shape[0]) if signal_lens[i].item() > 0 and current_sig.dim() > 0 and current_sig.shape[0] > 0 else 0
+            #          if current_len_abs <= 0:
+            #               logging.warning(f"Skipping augmentation for zero-length signal in batch id {current_id}")
+            #               proc_signals.append(torch.tensor([], device=self.device))
+            #               original_lengths.append(0)
+            #               continue
+            #          unpadded_sig = current_sig[:current_len_abs]
+            #          final_sig = unpadded_sig.to(self.device)
+            #          try:
+            #               # Manual Augmentations (on device) - Use getattr
+            #               if getattr(self.hparams, "gain_prob", 0) > 0:
+            #                   final_sig = _apply_gain(final_sig, self.hparams.gain_prob,
+            #                                            self.hparams.gain_db_low, self.hparams.gain_db_high)
+            #               if getattr(self.hparams, "pitch_prob", 0) > 0:
+            #                   final_sig = _apply_pitch_shift(final_sig, self.hparams.target_sample_rate,
+            #                                                  self.hparams.pitch_prob, self.hparams.pitch_steps_low,
+            #                                                  self.hparams.pitch_steps_high)
+            #          except Exception as aug_e:
+            #               logging.warning(f"Augmentation failed for {current_id}: {aug_e}. Using partially/un-augmented signal.")
+            #          if final_sig.numel() > 0 and torch.all(torch.isfinite(final_sig)):
+            #              proc_signals.append(final_sig)
+            #              original_lengths.append(final_sig.shape[0])
+            #          else:
+            #              logging.warning(f"Signal empty or NaN/Inf after augmentation for {current_id}. Appending empty tensor.")
+            #              proc_signals.append(torch.tensor([], device=self.device))
+            #              original_lengths.append(0)
 
-                     unpadded_sig = current_sig[:current_len_abs]
-                     final_sig = unpadded_sig.to(self.device)
-
-                     try:
-                          # Manual Augmentations (on device) - Use getattr
-                          if getattr(self.hparams, "gain_prob", 0) > 0:
-                              final_sig = _apply_gain(final_sig, self.hparams.gain_prob,
-                                                       self.hparams.gain_db_low, self.hparams.gain_db_high)
-                          if getattr(self.hparams, "pitch_prob", 0) > 0:
-                              final_sig = _apply_pitch_shift(final_sig, self.hparams.target_sample_rate,
-                                                             self.hparams.pitch_prob, self.hparams.pitch_steps_low,
-                                                             self.hparams.pitch_steps_high)
-
-                          # SpeechBrain Augmentations
-                          if self.augmenter is not None:
-                              sig_sb_aug, sb_len = self.augmenter(final_sig.unsqueeze(0), lengths=torch.tensor([1.0], device=self.device))
-                              if sig_sb_aug is not None and sig_sb_aug.numel() > 0: final_sig = sig_sb_aug.squeeze(0)
-                              else: logging.warning(f"SB Augmenter returned empty tensor for {current_id}.")
-
-                     except Exception as aug_e:
-                          logging.warning(f"Augmentation failed for {current_id}: {aug_e}. Using partially/un-augmented signal.")
-
-                     # Final check for empty signal and finite values before appending
-                     if final_sig.numel() > 0 and torch.all(torch.isfinite(final_sig)):
-                         proc_signals.append(final_sig)
-                         original_lengths.append(final_sig.shape[0])
-                     else:
-                         logging.warning(f"Signal empty or NaN/Inf after augmentation for {current_id}. Appending empty tensor.")
-                         proc_signals.append(torch.tensor([], device=self.device))
-                         original_lengths.append(0)
-
-
-                # Pad the augmented signals
-                if not proc_signals:
-                     logging.error("All signals in batch failed processing/augmentation.")
-                     wavs = torch.zeros((len(signals), 1), device=self.device)
-                     wav_lens = torch.zeros(len(signals), device=self.device)
-                else:
-                     valid_signals = [s for s in proc_signals if s.numel() > 0]
-                     if not valid_signals:
-                          logging.error("All signals became empty after processing.")
-                          wavs = torch.zeros((len(signals), 1), device=self.device)
-                          wav_lens = torch.zeros(len(signals), device=self.device)
-                     else:
-                          wavs = rnn_utils.pad_sequence(valid_signals, batch_first=True, padding_value=0.0)
-                          new_lengths_abs = torch.tensor([s.shape[0] for s in proc_signals], device=self.device)
-                          max_len = wavs.shape[1]
-                          wav_lens = new_lengths_abs.float() / max_len if max_len > 0 else torch.zeros_like(new_lengths_abs, dtype=torch.float)
-
-
-            # --- Tokenize Text with Correct Token Handling ---
+            # --- Tokenize Text (using the potentially augmented wav_lens if needed, but likely not) ---
+            # This part uses the original 'texts'
             try:
-                # Get raw token sequences
                 tokens_list = [self.tokenizer.encode(t) for t in texts]
-                
-                # Handle empty texts/tokens
-                if any(not t for t in texts):
-                     logging.warning(f"Empty text found in batch: {texts}. This might cause issues.")
-                if any(not tk for tk in tokens_list):
-                     logging.warning(f"Empty token list found after encoding batch texts: {texts} -> {tokens_list}. This WILL cause issues.")
-                
-                # Create decoder input sequences (tokens_bos)
-                # Use full prefix sequence [SOT, lang, task] + tokens
+                if any(not t for t in texts): logging.warning(f"Empty text found in batch: {texts}.")
+                if any(not tk for tk in tokens_list): logging.warning(f"Empty token list after encoding: {texts} -> {tokens_list}.")
+
                 bos_tokens_list = [torch.LongTensor(self.decoder_start_ids + t) for t in tokens_list]
-                
-                # Create target sequences (tokens_eos)
-                # Add EOT token to end of target sequence
                 eos_tokens_list = [torch.LongTensor(t + [self.eos_index]) for t in tokens_list]
-                
-                # Create reference sequences for metrics (without special tokens)
                 target_tokens_list = [torch.LongTensor(t) for t in tokens_list]
-                
+
             except Exception as e:
                  logging.error(f"Error encoding/creating token lists: {e}. Texts: {texts}")
                  raise ValueError(f"Error creating token lists: {e}")
 
-            # Pad sequences using correct pad token
+            # Pad sequences
             try:
-                tokens_bos_padded = rnn_utils.pad_sequence(
-                    bos_tokens_list, batch_first=True, 
-                    padding_value=self.pad_token_id
-                ).to(self.device)
-                
-                tokens_eos_padded = rnn_utils.pad_sequence(
-                    eos_tokens_list, batch_first=True,
-                    padding_value=self.pad_token_id
-                ).to(self.device)
-                
-                tokens_padded = rnn_utils.pad_sequence(
-                    target_tokens_list, batch_first=True,
-                    padding_value=self.pad_token_id
-                ).to(self.device)
-                
+                tokens_bos_padded = rnn_utils.pad_sequence(bos_tokens_list, batch_first=True, padding_value=self.pad_token_id).to(self.device)
+                tokens_eos_padded = rnn_utils.pad_sequence(eos_tokens_list, batch_first=True, padding_value=self.pad_token_id).to(self.device)
+                tokens_padded = rnn_utils.pad_sequence(target_tokens_list, batch_first=True, padding_value=self.pad_token_id).to(self.device)
             except Exception as e:
                  logging.error(f"Error padding token sequences: {e}. BOS List lengths: {[len(t) for t in bos_tokens_list]}")
                  bsz = len(texts); max_len_fallback = 1
@@ -540,7 +660,7 @@ class WhisperFineTuneBrain(sb.Brain):
                  tokens_eos_padded = torch.full((bsz, max_len_fallback), self.pad_token_id, dtype=torch.long, device=self.device)
                  tokens_padded = torch.full((bsz, max_len_fallback), self.pad_token_id, dtype=torch.long, device=self.device)
 
-            # Calculate sequence lengths
+            # **IMPORTANT**: Calculate token lengths based on the *original* token lists, NOT the potentially modified wav_lens
             bos_max_len = tokens_bos_padded.shape[1]
             eos_max_len = tokens_eos_padded.shape[1]
             tok_max_len = tokens_padded.shape[1]
@@ -555,8 +675,9 @@ class WhisperFineTuneBrain(sb.Brain):
             # Package into tuples
             tokens_bos = (tokens_bos_padded, tokens_bos_lens_rel)
             tokens_eos = (tokens_eos_padded, tokens_eos_lens_rel)
-            tokens = (tokens_padded, tokens_lens_rel)
+            tokens = (tokens_padded, tokens_lens_rel) # For metrics reference
 
+            # Return the potentially augmented wavs and their corresponding lengths
             return wavs.to(self.device), wav_lens.to(self.device), tokens_bos, tokens_eos, tokens, texts
 
         except Exception as e:
@@ -1042,37 +1163,6 @@ def train_whisper_on_modal():
                       logging.warning(f"Error calculating durations (multi-proc): {map_e}. Trying single process.")
                       raw_datasets[split] = raw_datasets[split].map(add_duration)
     except Exception as e: logging.error(f"Error processing dataset durations: {e}")
-
-
-    # --- Load Noise/RIR Paths ---
-    hparams["noise_paths"] = [] # Ensure keys exist even if empty
-    hparams["rir_paths"] = []
-    if hparams.get("augment", False):
-        try:
-             noise_ds_id = hparams.get("noise_dataset_id")
-             if noise_ds_id:
-                  logging.info(f"Preparing noise data paths from {noise_ds_id}")
-                  try:
-                       noise_ds = load_dataset(noise_ds_id, split="train", cache_dir=CACHE_DIR)
-                       noise_paths = [item['audio']['path'] for item in noise_ds if item and isinstance(item.get('audio'), dict) and item['audio'].get('path')]
-                       hparams["noise_paths"] = noise_paths
-                       logging.info(f"Loaded {len(noise_paths)} valid noise file paths.")
-                  except FileNotFoundError: logging.warning(f"Noise dataset {noise_ds_id} not found.")
-                  except Exception as e_noise_load: logging.warning(f"Could not load/process noise dataset {noise_ds_id}: {e_noise_load}")
-
-             rir_ds_id = hparams.get("rir_dataset_id")
-             if rir_ds_id:
-                  logging.info(f"Preparing RIR data paths from {rir_ds_id}")
-                  try:
-                       rir_ds = load_dataset(rir_ds_id, split="train", cache_dir=CACHE_DIR)
-                       rir_paths = [item['audio']['path'] for item in rir_ds if item and isinstance(item.get('audio'), dict) and item['audio'].get('path')]
-                       hparams["rir_paths"] = rir_paths
-                       logging.info(f"Loaded {len(rir_paths)} valid RIR file paths.")
-                  except FileNotFoundError: logging.warning(f"RIR dataset {rir_ds_id} not found.")
-                  except Exception as e_rir_load: logging.warning(f"Could not load/process RIR dataset {rir_ds_id}: {e_rir_load}")
-
-        except Exception as e: logging.warning(f"General error loading noise/RIR paths: {e}.")
-    else: logging.info("Skipping noise/RIR loading as augmentation is disabled.")
 
 
     # --- Instantiate Modules, Optimizer, Scheduler ---
