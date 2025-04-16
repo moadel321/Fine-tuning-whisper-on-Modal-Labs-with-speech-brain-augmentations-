@@ -184,10 +184,11 @@ hparams = {
     "lr_warmup_steps": 1000,  # Add warmup period to stabilize early training
     "weight_decay": 0.05,  # Strong regularization to prevent extreme weights
     "lr_annealing_factor": 0.9,
-    "batch_size_dynamic": True,
-    "max_batch_len_seconds": 5.0,  # Much shorter sequences for stability
+    "batch_size_dynamic": False,  # Use static batching for improved throughput
+    "loader_batch_size": 8,        # Static batch size
+    "max_batch_len_seconds": 5.0,  # Kept for potential dynamic batching fallback
     "num_workers": 4,
-    "grad_accumulation_factor": 8,  # Drastically increased for stability
+    "grad_accumulation_factor": 2,  # Lower accumulation for faster updates
     "max_grad_norm": 5.0,  # Extremely aggressive gradient clipping
 
     # Checkpointing
@@ -917,7 +918,7 @@ class WhisperFineTuneBrain(sb.Brain):
             return torch.tensor(0.0, device=self.device).cpu()
 
         # ***** Use getattr for hparams access *****
-        grad_accum = getattr(self.hparams, "grad_accumulation_factor", 8)  # Default to large accumulation
+        grad_accum = getattr(self.hparams, "grad_accumulation_factor", 2)
         should_step = self.step % grad_accum == 0
         loss = torch.tensor(0.0, device=self.device)
         
@@ -1258,40 +1259,44 @@ def train_whisper_on_modal():
     logging.info("Creating Dataloaders with DynamicBatchSampler...")
     train_loader_kwargs = valid_loader_kwargs = test_loader_kwargs = None
     try:
-        max_batch_length_samples = int(hparams.get("max_batch_len_seconds") * hparams.get("target_sample_rate"))
-
-        def length_func(item_dict):
-            duration = item_dict.get("duration")
-            if duration is None or not isinstance(duration, (int, float)) or duration < 0: return 0
-            return math.ceil(duration * hparams.get("target_sample_rate"))
+        dynamic_batching = hparams.get("batch_size_dynamic", True)
 
         loader_common_kwargs = {
-            "batch_size": 1, "num_workers": hparams.get("num_workers", 0),
+            "num_workers": hparams.get("num_workers", 0),
             "pin_memory": True if hparams.get("num_workers", 0) > 0 else False,
             "prefetch_factor": 2 if hparams.get("num_workers", 0) > 0 else None,
-             "collate_fn": PaddedBatch,
+            "collate_fn": PaddedBatch,
         }
 
-        train_split_name = hparams.get("train_split")
-        if train_split_name and train_split_name in datasets_dict:
-            train_sampler = DynamicBatchSampler(datasets_dict[train_split_name], max_batch_length=max_batch_length_samples, num_buckets=100, shuffle=True, batch_ordering="random", length_func=length_func)
-            train_loader_kwargs = { **loader_common_kwargs, "batch_sampler": train_sampler, "shuffle": False }
-            logging.info(f"Created Dataloader kwargs for train split: {train_split_name}")
-        else: logging.warning(f"Train split '{train_split_name}' not available for loader.")
+        if dynamic_batching:
+            max_batch_length_samples = int(hparams.get("max_batch_len_seconds") * hparams.get("target_sample_rate"))
 
-        valid_split_name = hparams.get("valid_split")
-        if valid_split_name and valid_split_name in datasets_dict:
-            valid_sampler = DynamicBatchSampler(datasets_dict[valid_split_name], max_batch_length=max_batch_length_samples, num_buckets=100, shuffle=False, batch_ordering="random", length_func=length_func)
-            valid_loader_kwargs = { **loader_common_kwargs, "batch_sampler": valid_sampler, "shuffle": False }
-            logging.info(f"Created Dataloader kwargs for validation split: {valid_split_name}")
-        else: logging.warning(f"Validation split '{valid_split_name}' not available for loader.")
+            def length_func(item_dict):
+                duration = item_dict.get("duration")
+                if duration is None or not isinstance(duration, (int, float)) or duration < 0: return 0
+                return math.ceil(duration * hparams.get("target_sample_rate"))
 
-        test_split_name = hparams.get("test_split")
-        if test_split_name and test_split_name in datasets_dict:
-            test_sampler = DynamicBatchSampler(datasets_dict[test_split_name], max_batch_length=max_batch_length_samples, num_buckets=100, shuffle=False, batch_ordering="random", length_func=length_func)
-            test_loader_kwargs = { **loader_common_kwargs, "batch_sampler": test_sampler, "shuffle": False }
-            logging.info(f"Created Dataloader kwargs for test split: {test_split_name}")
-        else: logging.warning(f"Test split '{test_split_name}' not available for loader.")
+            # DynamicBatchSampler settings
+            train_split_name = hparams.get("train_split")
+            if train_split_name and train_split_name in datasets_dict:
+                train_sampler = DynamicBatchSampler(datasets_dict[train_split_name], max_batch_length=max_batch_length_samples, num_buckets=100, shuffle=True, batch_ordering="random", length_func=length_func)
+                train_loader_kwargs = { **loader_common_kwargs, "batch_sampler": train_sampler, "shuffle": False }
+            if hparams.get("valid_split") in datasets_dict:
+                valid_sampler = DynamicBatchSampler(datasets_dict[hparams.get("valid_split")], max_batch_length=max_batch_length_samples, num_buckets=100, shuffle=False, batch_ordering="random", length_func=length_func)
+                valid_loader_kwargs = { **loader_common_kwargs, "batch_sampler": valid_sampler, "shuffle": False }
+            if hparams.get("test_split") in datasets_dict:
+                test_sampler = DynamicBatchSampler(datasets_dict[hparams.get("test_split")], max_batch_length=max_batch_length_samples, num_buckets=100, shuffle=False, batch_ordering="random", length_func=length_func)
+                test_loader_kwargs = { **loader_common_kwargs, "batch_sampler": test_sampler, "shuffle": False }
+        else:
+            static_bs = hparams.get("loader_batch_size", 8)
+            loader_common_kwargs["batch_size"] = static_bs
+
+            if hparams.get("train_split") in datasets_dict:
+                train_loader_kwargs = { **loader_common_kwargs, "shuffle": True }
+            if hparams.get("valid_split") in datasets_dict:
+                valid_loader_kwargs = { **loader_common_kwargs, "shuffle": False }
+            if hparams.get("test_split") in datasets_dict:
+                test_loader_kwargs = { **loader_common_kwargs, "shuffle": False }
 
         # Check if essential loaders were created
         if not train_loader_kwargs or not valid_loader_kwargs:
