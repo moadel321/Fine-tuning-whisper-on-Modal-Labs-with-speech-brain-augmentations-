@@ -90,6 +90,7 @@ app = modal.App("speechbrain-whisper-finetune-egyptian")
 
 # --- Secrets ---
 hf_secret = modal.Secret.from_name("huggingface-secret-write")
+wandb_secret = modal.Secret.from_name("wandb-secret") # Define the wandb secret object
 
 # --- Persistent Storage ---
 volume = modal.Volume.from_name(
@@ -174,41 +175,41 @@ hparams = {
     "task": "transcribe",
 
     # Token IDs (Updated from verification using Processor)
-    "sot_index": token_info["sot_token_id"] if token_info else 50258, # Use SOT specifically
+    "sot_index": token_info["sot_token_id"] if token_info else 50258,
     "eos_index": token_info["eos_token_id"] if token_info else 50257,
     "pad_token_id": token_info["pad_token_id"] if token_info else 50257,
-    "decoder_start_ids": token_info["decoder_start_ids"] if token_info else [50258, 50361, 50359, 50363], # Full prefix sequence
+    "decoder_start_ids": token_info["decoder_start_ids"] if token_info else [50258, 50361, 50359, 50363],
 
-    # Augmentation Params (Disabled for testing)
+    # Augmentation Params
     "augment": True,
-    "noise_prob": 0.25,  # Start low
-    "reverb_prob": 0.10,  # Start very low
+    "noise_prob": 0.25,
+    "reverb_prob": 0.10,
     "speed_prob": 0.25,
-    "pitch_prob": 0.10,  # Start low
+    "pitch_prob": 0.10,
     "gain_prob": 0.25,
     "min_augmentations": 1,
-    "max_augmentations": 1,  # Apply only one type per sample initially
-    "noise_snr_low": 15,    # Less noisy
+    "max_augmentations": 1,
+    "noise_snr_low": 15,
     "noise_snr_high": 25,
-    "speed_factors": [95, 105],  # Fewer options, smaller range
-    "pitch_steps_low": -1,  # Smaller range
+    "speed_factors": [95, 105],
+    "pitch_steps_low": -1,
     "pitch_steps_high": 1,
-    "gain_db_low": -4,     # Smaller range
+    "gain_db_low": -4,
     "gain_db_high": 4,
 
     # Training Params
     "seed": 1986,
     "epochs": 10,
-    "learning_rate": 5e-7,  # Drastically reduced for extreme stability
-    "lr_warmup_steps": 1000,  # Add warmup period to stabilize early training
-    "weight_decay": 0.05,  # Strong regularization to prevent extreme weights
+    "learning_rate": 5e-7,
+    "lr_warmup_steps": 1000,
+    "weight_decay": 0.05,
     "lr_annealing_factor": 0.9,
-    "batch_size_dynamic": False,  # Use static batching for improved throughput
-    "loader_batch_size": 8,        # Static batch size
-    "max_batch_len_seconds": 5.0,  # Kept for potential dynamic batching fallback
+    "batch_size_dynamic": False,
+    "loader_batch_size": 8,
+    "max_batch_len_seconds": 5.0,
     "num_workers": 4,
-    "grad_accumulation_factor": 2,  # Lower accumulation for faster updates
-    "max_grad_norm": 5.0,  # Extremely aggressive gradient clipping
+    "grad_accumulation_factor": 2,
+    "max_grad_norm": 5.0,
 
     # Checkpointing
     "ckpt_interval_minutes": 30,
@@ -216,6 +217,14 @@ hparams = {
 
     # Whisper decoding params
     "num_beams": 3,
+
+    # === W&B Configuration ===
+    "use_wandb": True,  # Flag to enable/disable easily
+    "wandb_project": "Whisper-Egyptian-Finetune",  # Project name
+    "wandb_entity": None,  # Optional: Your W&B username or team name
+    "wandb_log_batch_freq": 100,  # Log batch metrics every N steps
+    "wandb_watch_model": True,  # Whether to watch gradients
+    "wandb_watch_freq": 100,  # How often to log gradients
 }
 
 # Add a check after hparams definition
@@ -463,7 +472,9 @@ class WhisperFineTuneBrain(sb.Brain):
              logging.error(f"Error initializing tokenizer/indices: {e}")
              raise
 
+        # === Initialize SEPARATE metric objects ===
         self.wer_metric = ErrorRateStats()
+        # Initialize CER metric specifically telling it to split tokens (chars)
         self.cer_metric = ErrorRateStats(split_tokens=True)
 
         self.augmenter = None
@@ -838,100 +849,133 @@ class WhisperFineTuneBrain(sb.Brain):
              return torch.tensor(0.0, device=self.device, requires_grad=stage==sb.Stage.TRAIN)
 
 
-    # --- on_stage_start (Unchanged from V3) ---
+    # --- on_stage_start (Initialize BOTH metric objects) ---
     def on_stage_start(self, stage, epoch):
         try:
+            # Re-initialize both at the start of validation/test stages
             self.wer_metric = ErrorRateStats()
-            if stage != sb.Stage.TRAIN:
-                 self.cer_metric = ErrorRateStats(split_tokens=True)
-            logging.info(f"Initialized metrics for stage {stage}.")
-        except Exception as e: logging.error(f"Error initializing metrics for stage {stage}: {e}")
+            self.cer_metric = ErrorRateStats(split_tokens=True)
+            logging.info(f"Initialized WER/CER metrics for stage {stage}.")
+        except Exception as e: 
+            logging.error(f"Error initializing metrics for stage {stage}: {e}")
 
-
-    # --- on_stage_end (Corrected Logic) ---
+    # --- on_stage_end (Summarize from SEPARATE objects) ---
     def on_stage_end(self, stage, stage_loss, epoch):
+        stage_stats = {}
         try:
             # --- Get current LR ---
             current_lr = 'N/A'
             if hasattr(self, 'optimizer') and self.optimizer and hasattr(self.optimizer, 'param_groups') and self.optimizer.param_groups:
-                 try: current_lr = self.optimizer.param_groups[0]['lr']
-                 except: logging.warning("Could not retrieve learning rate.")
+                try: 
+                    current_lr = self.optimizer.param_groups[0]['lr']
+                except Exception: 
+                    logging.warning("Could not retrieve learning rate.")
 
             # === Store Train Loss when TRAIN stage ends ===
             if stage == sb.Stage.TRAIN:
-                # Store the calculated train loss in a temporary variable
-                # self.avg_train_loss will be reset by Brain.fit() right after this returns
                 self._current_epoch_train_loss = getattr(self, 'avg_train_loss', 0.0)
-                print(f"--- PRINT DEBUG on_stage_end(TRAIN): Storing train_loss = {self._current_epoch_train_loss} ---", file=sys.stderr, flush=True)
-                # No further logging needed here for the TRAIN stage itself
+                stage_stats["train_loss_epoch_avg"] = self._current_epoch_train_loss
 
-            # === Log metrics when VALID stage ends ===
-            elif stage == sb.Stage.VALID:
-                stage_stats = {"loss": stage_loss}
-                wer = cer = None
+            # === Log metrics when VALID or TEST stage ends ===
+            elif stage == sb.Stage.VALID or stage == sb.Stage.TEST:
+                stage_key_prefix = "valid" if stage == sb.Stage.VALID else "test"
+                stage_stats["loss"] = stage_loss
+                wer = cer = float('inf')  # Initialize to infinity
                 try:
-                    # Calculate WER/CER as before
-                    wer = self.wer_metric.summarize("error_rate")
-                    cer = self.cer_metric.summarize("error_rate")
-                    stage_stats["WER"] = wer if isinstance(wer, (int, float)) else float('inf')
-                    stage_stats["CER"] = cer if isinstance(cer, (int, float)) else float('inf')
+                    # Summarize from separate objects
+                    wer = self.wer_metric.summarize("error_rate")  # Default is WER
+                    cer = self.cer_metric.summarize("error_rate")  # Default is also error_rate, but calculated on chars
+
+                    stage_stats["WER"] = wer if math.isfinite(wer) else float('inf')
+                    stage_stats["CER"] = cer if math.isfinite(cer) else float('inf')
                 except Exception as e:
-                    logging.error(f"Error summarizing WER/CER metrics: {e}")
-                    stage_stats["WER"] = stage_stats["CER"] = float('inf')
+                    logging.error(f"Error summarizing {stage_key_prefix} WER/CER metrics: {e}")
+                    # Keep WER/CER as infinity
 
-                try:
-                    # Retrieve the *stored* train loss from the end of the TRAIN stage
-                    train_loss_to_log = getattr(self, '_current_epoch_train_loss', 'N/A_MISSING')
-                    print(f"--- PRINT DEBUG on_stage_end(VALID): Using stored train_loss = {train_loss_to_log} for logging ---", file=sys.stderr, flush=True)
-
-                    train_logger = getattr(self.hparams, "train_logger", None)
-                    if train_logger:
-                        train_logger.log_stats(
-                            stats_meta={"epoch": epoch, "lr": current_lr},
-                            # Use the stored value here!
-                            train_stats={'loss': train_loss_to_log},
-                            valid_stats=stage_stats,
-                        )
-                    else:
-                        logging.warning("Train logger not available for logging validation stats.")
-                except Exception as e:
-                    logging.error(f"Error logging validation stats: {e}")
-
-                # --- Checkpointing (using validation WER) ---
-                num_to_keep = getattr(self.hparams, "num_checkpoints_to_keep", 1)
-                if wer is not None and math.isfinite(wer) and hasattr(self, 'checkpointer') and self.checkpointer:
+                # --- Log to File Logger (or WandbLogger via log_stats) ---
+                if stage == sb.Stage.VALID:
                     try:
-                        self.checkpointer.save_and_keep_only(meta={"WER": wer}, min_keys=["WER"], num_to_keep=num_to_keep)
-                    except Exception as e: logging.error(f"Error saving checkpoint: {e}")
+                        train_loss_to_log = getattr(self, '_current_epoch_train_loss', 0.0)
+                        file_logger = getattr(self.hparams, "train_logger", None) # Will be FileTrainLogger or WandbLogger
+                        if file_logger:
+                            file_logger.log_stats(
+                                stats_meta={"epoch": epoch, "lr": current_lr},
+                                train_stats={'loss': train_loss_to_log}, # Pass avg train loss
+                                valid_stats=stage_stats,  # Contains loss, WER, CER
+                            )
+                    except Exception as e:
+                        logging.error(f"Error logging validation stats via logger: {e}")
+                elif stage == sb.Stage.TEST:
+                    file_logger = getattr(self.hparams, "train_logger", None) # Will be FileTrainLogger or WandbLogger
+                    if file_logger:
+                        loaded_epoch = getattr(self.hparams.epoch_counter, 'current', 'N/A')
+                        file_logger.log_stats(
+                            stats_meta={"Epoch loaded": loaded_epoch}, 
+                            test_stats=stage_stats
+                        )
 
-            elif stage == sb.Stage.TEST:
-                try:
-                    # ***** Use getattr for hparams access *****
-                    train_logger = getattr(self.hparams, "train_logger", None)
-                    loaded_epoch = getattr(self.hparams.epoch_counter, 'current', 'N/A')
-                    if train_logger:
-                        train_logger.log_stats(stats_meta={"Epoch loaded": loaded_epoch}, test_stats=stage_stats)
-                    else:
-                        logging.warning("Train logger not available for logging test stats.")
-                except Exception as e: logging.error(f"Error logging test stats: {e}")
+                # --- RE-ADD Manual W&B logging for epoch stats ---
+                if getattr(self.hparams, "use_wandb", False):
+                    try:
+                        import wandb
+                        # Check if wandb.run is active (initialized successfully earlier)
+                        if wandb.run: 
+                            if stage == sb.Stage.VALID:
+                                # Ensure train_loss_to_log is available
+                                train_loss_to_log = getattr(self, '_current_epoch_train_loss', 0.0)
+                                wandb_metrics = {
+                                    "epoch": epoch,
+                                    "learning_rate": current_lr if isinstance(current_lr, (int, float)) else -1.0,
+                                    "loss/train_epoch": train_loss_to_log,
+                                    f"loss/{stage_key_prefix}_epoch": stage_stats.get("loss", float('inf')),
+                                    f"error_rate/{stage_key_prefix}_WER": stage_stats.get("WER", float('inf')),
+                                    f"error_rate/{stage_key_prefix}_CER": stage_stats.get("CER", float('inf')),
+                                }
+                            elif stage == sb.Stage.TEST:
+                                wandb_metrics = {
+                                    f"final/{stage_key_prefix}_loss": stage_stats.get("loss", float('inf')),
+                                    f"final/{stage_key_prefix}_WER": stage_stats.get("WER", float('inf')),
+                                    f"final/{stage_key_prefix}_CER": stage_stats.get("CER", float('inf')),
+                                }
+                            else: # Should not happen in this elif block, but safety first
+                                wandb_metrics = {}
+                            
+                            if wandb_metrics: # Only log if we have metrics
+                                wandb_metrics_clean = {k: v for k, v in wandb_metrics.items() if math.isfinite(v)}
+                                wandb.log(wandb_metrics_clean)
+                                logging.info(f"Logged {stage_key_prefix} epoch metrics to WandB.")
+                        else:
+                            logging.warning("WandB run not active, skipping epoch log.")
+                    except ImportError:
+                        logging.warning("wandb library not found during epoch logging.")
+                    except Exception as e:
+                        logging.error(f"Error logging {stage_key_prefix} stats to WandB: {e}")
 
-                try:
-                    # ***** Use getattr for hparams access *****
-                    output_folder = getattr(self.hparams, "output_folder", ".")
-                    os.makedirs(output_folder, exist_ok=True)
-                    wer_file = os.path.join(output_folder, "wer_test.txt")
-                    with open(wer_file, "w", encoding="utf-8") as w:
-                         w.write(f"Final TEST stats (Epoch loaded: {loaded_epoch}):\n")
-                         w.write(f"Loss: {stage_loss:.4f}\n")
-                         if wer is not None and math.isfinite(wer): w.write(f"WER: {wer:.2f}\n"); self.wer_metric.write_stats(w)
-                         else: w.write("WER: Error or NaN/Inf\n")
-                         w.write("\nCER Metrics:\n")
-                         if cer is not None and math.isfinite(cer): w.write(f"CER: {cer:.2f}\n"); self.cer_metric.write_stats(w)
-                         else: w.write("CER: Error or NaN/Inf\n")
-                    logging.info(f"Test WER/CER stats saved to {wer_file}")
-                except Exception as e: logging.error(f"Error writing test results file: {e}")
+                # --- Checkpointing (Only on VALID stage) ---
+                if stage == sb.Stage.VALID:
+                    num_to_keep = getattr(self.hparams, "num_checkpoints_to_keep", 1)
+                    if wer is not None and math.isfinite(wer) and hasattr(self, 'checkpointer') and self.checkpointer:
+                        try:
+                            self.checkpointer.save_and_keep_only(
+                                meta={"WER": wer}, 
+                                min_keys=["WER"], 
+                                num_to_keep=num_to_keep
+                            )
+                        except Exception as e: 
+                            logging.error(f"Error saving checkpoint: {e}")
 
-        except Exception as e: logging.error(f"Error in on_stage_end for stage {stage}: {e}", exc_info=True)
+        except Exception as e:
+            is_wandb_enabled = getattr(self.hparams, "use_wandb", False)
+            logging.error(f"Error in on_stage_end for stage {stage} (W&B enabled: {is_wandb_enabled}): {e}", exc_info=True)
+
+        # Clear metrics after VALID or TEST stage finishes logging them
+        if stage == sb.Stage.VALID or stage == sb.Stage.TEST:
+            if hasattr(self, "wer_metric"): 
+                self.wer_metric.clear()
+            if hasattr(self, "cer_metric"): 
+                self.cer_metric.clear()
+
+        return stage_stats
 
     # --- on_fit_start (Updated with temporary variable) ---
     def on_fit_start(self):
@@ -950,13 +994,13 @@ class WhisperFineTuneBrain(sb.Brain):
             logging.error("Optimizer not found in fit_batch!")
             return torch.tensor(0.0, device=self.device).cpu()
 
-        # ***** Use getattr for hparams access *****
-        grad_accum = getattr(self.hparams, "grad_accumulation_factor", 2)
-        should_step = self.step % grad_accum == 0
+        # --- Boilerplate and Warmup ---
+        grad_accum = getattr(self.hparams, "grad_accumulation_factor", 1)  # Default 1 if not set
+        should_step = (self.step + 1) % grad_accum == 0  # Correct step check for grad accum
         loss = torch.tensor(0.0, device=self.device)
         
         # Learning rate warmup
-        warmup_steps = getattr(self.hparams, "lr_warmup_steps", 1000)
+        warmup_steps = getattr(self.hparams, "lr_warmup_steps", 0)  # Default 0
         if hasattr(self, 'step_counter'):
             self.step_counter += 1
         else:
@@ -968,97 +1012,102 @@ class WhisperFineTuneBrain(sb.Brain):
             base_lr = getattr(self.hparams, "learning_rate", 1e-5)
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = base_lr * warmup_factor
-            if self.step_counter % 100 == 0:  # Log occasionally
-                logging.info(f"Warmup step {self.step_counter}/{warmup_steps}, LR={base_lr * warmup_factor:.8f}")
 
         try:
             outputs = self.compute_forward(batch, sb.Stage.TRAIN)
             loss = self.compute_objectives(outputs, batch, sb.Stage.TRAIN)
+            batch_loss_value = loss.detach().item()  # Get value for logging
 
-            # --- SIMPLIFIED Loss Handling & Backward ---
+            # --- Loss Handling & Backward ---
             if isinstance(loss, torch.Tensor) and loss.requires_grad:
                 if not torch.isfinite(loss):
                     logging.warning(f"Non-finite loss detected: {loss.item()}. Skipping backward/step.")
-                    loss = torch.tensor(0.0, device=self.device) # Return 0 loss for logging if NaN/Inf
-                    # Do not proceed with backward/step if loss is invalid
+                    batch_loss_value = float('nan')  # Record NaN for logging
+                    loss = torch.tensor(0.0, device=self.device)  # Avoid error in buffer append
                 else:
                     try:
                         scaled_loss = loss / grad_accum
                         scaled_loss.backward()
-                    except RuntimeError as e:
-                        logging.error(f"RuntimeError during backward(): {e}. Skipping step.")
-                        if self.optimizer: self.optimizer.zero_grad(set_to_none=True)
                     except Exception as e:
                         logging.error(f"Error during backward(): {e}. Skipping step.")
-                        if self.optimizer: self.optimizer.zero_grad(set_to_none=True)
+                        if self.optimizer:
+                            self.optimizer.zero_grad(set_to_none=True)
+                        should_step = False
+            else:
+                should_step = False  # Don't step if loss wasn't valid for backward
+                batch_loss_value = float('nan')  # Record NaN
+                if not isinstance(loss, torch.Tensor):
+                    loss = torch.tensor(0.0, device=self.device)
 
-            else: # Handle cases where loss is not valid for backward
-                current_loss_val = loss.item() if isinstance(loss, torch.Tensor) else loss
-                logging.warning(f"Invalid loss for backward: type={type(loss)}, requires_grad={getattr(loss, 'requires_grad', False)}, isfinite={torch.isfinite(loss) if isinstance(loss, torch.Tensor) else 'N/A'}, value={current_loss_val}. Skipping backward/step.")
-                if not isinstance(loss, torch.Tensor): loss = torch.tensor(0.0, device=self.device) # Ensure tensor type for logging
-                # Do not proceed with step if loss wasn't valid for backward
-                should_step = False
-
-            # --- Standard Gradient Clipping & Optimizer Step ---
-            if should_step and torch.isfinite(loss) and loss.requires_grad: # Only step if backward was likely successful
+            # --- Grad Norm Calc, Clipping & Optimizer Step ---
+            current_grad_norm = float('nan')  # Initialize for logging
+            if should_step:  # Only if loss was valid and it's time to step
                 try:
-                    # ----------------------------------------------------
-                    # Verbose gradient‑norm diagnostics (detect explosions)
-                    # ----------------------------------------------------
-                    try:
-                        total_norm_sq = 0.0
-                        max_norm_val = 0.0
-                        max_norm_name = None
-                        for n, p in self.modules.named_parameters():
-                            if p.grad is not None:
-                                param_norm = p.grad.data.norm(2).item()
-                                total_norm_sq += param_norm ** 2
-                                if param_norm > max_norm_val:
-                                    max_norm_val = param_norm
-                                    max_norm_name = n
-                        total_grad_norm = math.sqrt(total_norm_sq)
-                        logging.info(
-                            f"Step {self.step}: total grad L2 = {total_grad_norm:.3f}; "
-                            f"max single‑param grad norm = {max_norm_val:.3f} ({max_norm_name})"
-                        )
-                    except Exception as gn_e:
-                        logging.warning(f"Could not compute gradient norms: {gn_e}")
+                    # Calculate gradient norm BEFORE clipping for logging
+                    total_norm_sq = 0.0
+                    max_norm_val = 0.0
+                    max_norm_name = None
+                    for n, p in self.modules.named_parameters():
+                        if p.grad is not None:
+                            param_norm = p.grad.data.norm(2).item()
+                            total_norm_sq += param_norm ** 2
+                            if param_norm > max_norm_val:
+                                max_norm_val = param_norm
+                                max_norm_name = n
+                    current_grad_norm = math.sqrt(total_norm_sq)
 
-                    try:
-                        # Single, standard gradient clipping step
-                        max_norm = getattr(self.hparams, "max_grad_norm", 1.0) # Start with 1.0 or 5.0
-                        torch.nn.utils.clip_grad_norm_(self.modules.parameters(), max_norm)
+                    # Clip Gradients
+                    max_norm = getattr(self.hparams, "max_grad_norm", 5.0)
+                    torch.nn.utils.clip_grad_norm_(self.modules.parameters(), max_norm)
 
-                        # Optimizer step
-                        self.optimizer.step()
-                        self.optimizer.zero_grad(set_to_none=True) # Use set_to_none for efficiency
-
-                    except Exception as e:
-                        logging.error(f"Error during optimizer step/clipping/zero_grad: {e}")
-                        try:
-                            if self.optimizer: self.optimizer.zero_grad(set_to_none=True)
-                        except Exception as zg_e: logging.error(f"Error during zero_grad after step error: {zg_e}")
+                    # Optimizer Step
+                    self.optimizer.step()
+                    self.optimizer.zero_grad(set_to_none=True)
 
                 except Exception as e:
                     logging.error(f"Error during optimizer step/clipping/zero_grad: {e}")
                     try:
-                        if self.optimizer: self.optimizer.zero_grad(set_to_none=True)
-                    except Exception as zg_e: logging.error(f"Error during zero_grad after step error: {zg_e}")
+                        if self.optimizer:
+                            self.optimizer.zero_grad(set_to_none=True)
+                    except Exception as zg_e:
+                        logging.error(f"Error during zero_grad after step error: {zg_e}")
 
-            # Accumulate loss for logging (even if step was skipped)
-            try:
-                loss_value = loss.detach().item() if isinstance(loss, torch.Tensor) else float(loss)
-                logging.info(f"Appending batch loss to buffer: {loss_value:.6f}")
-            except Exception as _log_exc:
-                logging.warning(f"Could not log batch loss value: {_log_exc}")
+            # --- Log Batch Metrics to W&B ---
+            log_freq = getattr(self.hparams, "wandb_log_batch_freq", 0)  # Default 0 (disabled)
+            if getattr(self.hparams, "use_wandb", False) and log_freq > 0 and (self.step + 1) % log_freq == 0:
+                try:
+                    import wandb
+                    if wandb.run:
+                        wandb_step_metrics = {
+                            "train/batch_loss": batch_loss_value,
+                            "train/gradient_norm": current_grad_norm,
+                            "train/max_grad_norm": max_norm_val if 'max_norm_val' in locals() else float('nan'),
+                            "train/learning_rate": self.optimizer.param_groups[0]['lr'],
+                            "trainer/global_step": self.step,
+                            "trainer/should_step": int(should_step),
+                        }
+                        if max_norm_name:
+                            wandb_step_metrics["train/max_grad_param"] = max_norm_name
+                        
+                        # Only log finite values
+                        wandb.log({k: v for k, v in wandb_step_metrics.items() if math.isfinite(v) if not isinstance(v, str)})
+                        
+                        # Log string values separately
+                        str_metrics = {k: v for k, v in wandb_step_metrics.items() if isinstance(v, str)}
+                        if str_metrics:
+                            wandb.log(str_metrics)
+                            
+                except Exception as wandb_log_e:
+                    logging.warning(f"Could not log step metrics to W&B: {wandb_log_e}")
 
-            self._train_loss_buffer.append(loss.detach().item())
+            # --- Accumulate loss for epoch average ---
+            self._train_loss_buffer.append(batch_loss_value)
 
         except Exception as e:
             logging.error(f"Error in fit_batch: {e}", exc_info=True)
-            loss = torch.tensor(0.0) # CPU tensor default
+            loss = torch.tensor(float('nan'))  # Return NaN on error
 
-        return loss.detach().cpu()
+        return loss.cpu() if isinstance(loss, torch.Tensor) else torch.tensor(loss)
 
     # --- on_train_epoch_end (WITH FILE DEBUGGING) ---
     def on_train_epoch_end(self, epoch):
@@ -1173,349 +1222,381 @@ logging.info("Defining Modal training function...")
     gpu="H100", 
     cpu=8,
     volumes={CHECKPOINT_DIR: volume},
-    secrets=[hf_secret],
+    secrets=[hf_secret, wandb_secret],
     timeout=7200
 )
 def train_whisper_on_modal():
-    logging.info("=== Starting train_whisper_on_modal function ===")
-    logging.info("Python version: %s", sys.version)
-    logging.info("Current working directory: %s", os.getcwd())
-    logging.info("Environment variables: %s", str(dict(os.environ)))
-    
-    logging.info("Importing required libraries for training...")
-    try:
-        logging.info("Importing torch...")
-        import torch
-        logging.info(f"PyTorch version: {torch.__version__}")
-        logging.info(f"CUDA available: {torch.cuda.is_available()}")
-        if torch.cuda.is_available():
-            logging.info(f"CUDA device: {torch.cuda.get_device_name(0)}")
-            logging.info(f"CUDA version: {torch.version.cuda}")
-            logging.info(f"Number of GPUs: {torch.cuda.device_count()}")
-            for i in range(torch.cuda.device_count()):
-                logging.info(f"GPU {i}: {torch.cuda.get_device_properties(i)}")
-        
-        logging.info("Importing speechbrain...")
-        import speechbrain as sb
-        logging.info(f"SpeechBrain version: {sb.__version__}")
-        
-        logging.info("Importing datasets...")
-        from datasets import load_dataset, DatasetDict, Audio, concatenate_datasets
-        logging.info("Datasets library imported successfully")
-        
-        logging.info("Importing SpeechBrain components...")
-        from speechbrain.dataio.dataset import DynamicItemDataset
-        from speechbrain.dataio.dataloader import SaveableDataLoader
-        from speechbrain.dataio.batch import PaddedBatch
-        from speechbrain.dataio.sampler import DynamicBatchSampler
-        from speechbrain.utils.distributed import run_on_main, ddp_init_group
-        from speechbrain.lobes.models.huggingface_transformers.whisper import Whisper
-        logging.info("SpeechBrain components imported successfully")
-        
-        logging.info("Importing optimization libraries...")
-        import torch.optim as optim
-        import pandas as pd
-        import math
-        logging.info("Optimization libraries imported successfully")
-        
-        logging.info("All imports completed successfully")
-    except Exception as e:
-        logging.error(f"Error during imports: {e}", exc_info=True)
-        raise
+    global hparams # Keep global for now, though passing explicitly might be cleaner
+    wandb_run = None # Initialize wandb_run variable
 
-    try:
-        logging.info("Accessing global variables and configurations...")
-        global hparams
-        logging.info("Starting training function execution...")
-
-        # Access hparams safely using .get for top-level keys
-        output_folder = hparams.get("output_folder")
-        save_folder = hparams.get("save_folder")
-        logging.info(f"Output folder: {output_folder}")
-        logging.info(f"Save folder: {save_folder}")
-        
-        if not output_folder or not save_folder:
-            logging.error("output_folder or save_folder not defined in hparams.")
-            return
-
-        logging.info(f"Creating output directories: {output_folder}, {save_folder}")
-        os.makedirs(output_folder, exist_ok=True)
-        os.makedirs(save_folder, exist_ok=True)
-        logging.info("Output directories created successfully")
-        
-    except Exception as e:
-        logging.error(f"Error in initial setup: {e}", exc_info=True)
-        raise
-
-    try:
-        sb.utils.seed.seed_everything(hparams.get("seed", 1234)) # Use default seed if missing
-        logging.info(f"Set random seed to {hparams.get('seed', 1234)}")
-    except Exception as e: logging.warning(f"Error setting seed: {e}")
-
-
-    # --- Load Main Dataset ---
-    raw_datasets = None
-    hf_dataset_id = hparams.get("hf_dataset_id")
-    if not hf_dataset_id: logging.error("`hf_dataset_id` not found in hparams."); return
-    try:
-        logging.info(f"Loading HF dataset: {hf_dataset_id}")
-        raw_datasets = load_dataset(hf_dataset_id, cache_dir=CACHE_DIR)
-        logging.info(f"Raw datasets loaded:\n{raw_datasets}")
-    except FileNotFoundError: logging.error(f"Dataset {hf_dataset_id} not found or cache dir issue."); return
-    except Exception as e: logging.error(f"Error loading main dataset {hf_dataset_id}: {e}"); return
-
-
-    # --- Add duration if missing ---
-    def add_duration(batch):
-        duration = 0.0
+    # === Robust W&B Initialization (Manual Approach) ===
+    if getattr(hparams, "use_wandb", False):
         try:
-            audio_data = batch.get("audio")
-            if audio_data and isinstance(audio_data, dict):
-                 array = audio_data.get("array")
-                 sampling_rate = audio_data.get("sampling_rate")
-                 if array is not None and sampling_rate is not None and sampling_rate > 0:
-                      duration = len(array) / sampling_rate
-            batch["duration"] = duration
-        except Exception as e: logging.warning(f"Could not calculate duration: {e}. Setting to {duration}."); batch["duration"] = duration
-        return batch
+            import wandb
+            from datetime import datetime
+            if not os.environ.get("WANDB_API_KEY"):
+                 logging.warning("WANDB_API_KEY environment variable not found. W&B might fail.")
 
-    try:
-        for split in raw_datasets:
-            if 'duration' not in raw_datasets[split].column_names:
-                 logging.info(f"Calculating duration for split: {split}")
-                 try:
-                      num_proc = min(os.cpu_count() if os.cpu_count() else 1, 4)
-                      raw_datasets[split] = raw_datasets[split].map(add_duration, num_proc=num_proc)
-                 except Exception as map_e:
-                      logging.warning(f"Error calculating durations (multi-proc): {map_e}. Trying single process.")
-                      raw_datasets[split] = raw_datasets[split].map(add_duration)
-    except Exception as e: logging.error(f"Error processing dataset durations: {e}")
+            wandb_run = wandb.init(
+                project=getattr(hparams, "wandb_project", "speechbrain-default"),
+                entity=getattr(hparams, "wandb_entity", None),
+                config=hparams,
+                name=f"whisper-egy-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
+                job_type="train",
+                resume=False, # Explicitly set resume behavior if needed
+            )
+            logging.info(f"WandB run initialized: {wandb_run.name} ({wandb_run.id}) - View at {wandb_run.url}")
+        except ImportError:
+            logging.warning("wandb library not found. Skipping WandB.")
+            hparams["use_wandb"] = False
+            wandb_run = None
+        except Exception as e:
+            logging.error(f"Could not initialize WandB: {e}", exc_info=True)
+            hparams["use_wandb"] = False
+            wandb_run = None
 
+    try: # Main training try block
+        logging.info("=== Starting train_whisper_on_modal function ===")
+        logging.info("Python version: %s", sys.version)
+        logging.info("Current working directory: %s", os.getcwd())
+        # Avoid logging all env vars, can be too verbose and contain sensitive info
+        # logging.info("Environment variables: %s", str(dict(os.environ)))
 
-    # --- Instantiate Modules, Optimizer, Scheduler ---
-    whisper_model = modules = optimizer = lr_scheduler = None
-    try:
-        logging.info("Initializing model, optimizer, scheduler...")
-        whisper_model = Whisper(
-            source=hparams.get("whisper_hub"), save_path=save_folder, encoder_only=False,
-            language=hparams.get("language"), task=hparams.get("task")
-        )
-        modules = {"whisper": whisper_model}
-        # Create parameter groups with different learning rates
-        no_decay = ['bias', 'LayerNorm.weight', 'layer_norm.weight']
-        params = [
-            {
-                'params': [p for n, p in modules["whisper"].named_parameters() 
-                          if p.requires_grad and not any(nd in n for nd in no_decay)],
-                'weight_decay': hparams.get("weight_decay", 0.05),
-                'lr': hparams.get("learning_rate", 1e-7),
-            },
-            {
-                'params': [p for n, p in modules["whisper"].named_parameters() 
-                          if p.requires_grad and any(nd in n for nd in no_decay)],
-                'weight_decay': 0.0,
-                'lr': hparams.get("learning_rate", 1e-7),
-            }
-        ]
-        
-        optimizer = optim.AdamW(
-            params=params,
-            lr=hparams.get("learning_rate", 1e-7),
-            betas=(0.9, 0.999),  # Default values that work well for most cases
-            eps=1e-8,            # Increased epsilon for better numerical stability
-            weight_decay=hparams.get("weight_decay", 0.05)  # Strong regularization
-        )
-        lr_scheduler = sb.nnet.schedulers.NewBobScheduler(
-            initial_value=hparams.get("learning_rate"), improvement_threshold=hparams.get("lr_improvement_threshold", 0.0025),
-            annealing_factor=hparams.get("lr_annealing_factor"), patient=hparams.get("lr_patient", 0)
-        )
-        logging.info("Model, optimizer, scheduler initialized.")
-    except KeyError as e: logging.error(f"Missing critical hparam for setup: {e}"); return
-    except Exception as e: logging.error(f"Error initializing model/optimizer/scheduler: {e}", exc_info=True); return
+        logging.info("Importing required libraries for training...")
+        try:
+            logging.info("Importing torch...")
+            import torch
+            logging.info(f"PyTorch version: {torch.__version__}")
+            logging.info(f"CUDA available: {torch.cuda.is_available()}")
+            if torch.cuda.is_available():
+                logging.info(f"CUDA device count: {torch.cuda.device_count()}")
+                for i in range(torch.cuda.device_count()):
+                    logging.info(f"GPU {i}: {torch.cuda.get_device_name(i)} Properties: {torch.cuda.get_device_properties(i)}")
+                logging.info(f"CUDA version: {torch.version.cuda}")
 
-    # --- Checkpointer and Logger ---
-    epoch_counter = checkpointer = train_logger = None
-    try:
-        epoch_counter = sb.utils.epoch_loop.EpochCounter(limit=hparams.get("epochs"))
-        checkpointer = sb.utils.checkpoints.Checkpointer(
-            checkpoints_dir=save_folder,
-            recoverables={ "model": modules["whisper"], "scheduler": lr_scheduler, "counter": epoch_counter, "optimizer": optimizer, },
-        )
-        hparams["train_logger"] = sb.utils.train_logger.FileTrainLogger(save_file=os.path.join(output_folder, "train_log.txt"))
-        train_logger = hparams["train_logger"]
-        logging.info("Checkpointer and TrainLogger initialized.")
-    except KeyError as e: logging.error(f"Missing critical hparam for checkpointer/logger setup: {e}") # Decide if fatal
-    except Exception as e: logging.error(f"Error initializing checkpointer/logger: {e}", exc_info=True) # Decide if fatal
+            logging.info("Importing speechbrain...")
+            import speechbrain as sb
+            logging.info(f"SpeechBrain version: {sb.__version__}")
 
+            logging.info("Importing datasets...")
+            from datasets import load_dataset, DatasetDict, Audio, concatenate_datasets
+            logging.info("Datasets library imported successfully")
 
-    # --- Create Datasets ---
-    logging.info("Creating SpeechBrain DynamicItemDatasets...")
-    datasets_dict = {}
-    output_keys = ["id", "signal_raw", "text_raw", "duration"]
+            logging.info("Importing SpeechBrain components...")
+            from speechbrain.dataio.dataset import DynamicItemDataset
+            from speechbrain.dataio.dataloader import SaveableDataLoader
+            from speechbrain.dataio.batch import PaddedBatch
+            from speechbrain.dataio.sampler import DynamicBatchSampler
+            from speechbrain.utils.distributed import run_on_main, ddp_init_group
+            # Revert logger import to only FileTrainLogger
+            from speechbrain.utils.train_logger import FileTrainLogger 
+            from speechbrain.lobes.models.huggingface_transformers.whisper import Whisper
+            logging.info("SpeechBrain components imported successfully")
 
-    try:
-        required_splits = [hparams.get("train_split"), hparams.get("valid_split"), hparams.get("test_split")]
-        required_splits = [s for s in required_splits if s] # Filter out None if keys missing
-        if not required_splits: logging.error("No dataset split names defined in hparams."); return
+            logging.info("Importing optimization libraries...")
+            import torch.optim as optim
+            import pandas as pd
+            import math
+            logging.info("Optimization libraries imported successfully")
 
-        for split in required_splits:
-            if split in raw_datasets:
-                dynamic_items = [audio_pipeline_minimal, text_pipeline_minimal]
-                hf_dataset_split = raw_datasets[split]
-                data_dict = {str(i): hf_dataset_split[i] for i in range(len(hf_dataset_split))}
+            logging.info("All imports completed successfully")
+        except Exception as e:
+            logging.error(f"Error during imports: {e}", exc_info=True)
+            raise
 
-                datasets_dict[split] = DynamicItemDataset(
-                     data=data_dict, dynamic_items=dynamic_items, output_keys=output_keys,
-                )
-                logging.info(f"Successfully created DynamicItemDataset for split: {split} with {len(datasets_dict[split])} items.")
-            else:
-                 logging.warning(f"Split '{split}' not found in loaded dataset. Skipping.")
+        # --- Setup: Folders, Seed ---
+        try:
+            logging.info("Accessing global variables and configurations...")
+            output_folder = hparams.get("output_folder")
+            save_folder = hparams.get("save_folder")
+            logging.info(f"Output folder: {output_folder}")
+            logging.info(f"Save folder: {save_folder}")
 
-        # Check if essential splits were created
-        if not hparams.get("train_split") in datasets_dict or not hparams.get("valid_split") in datasets_dict:
-             logging.error("Essential train or validation dataset could not be created. Exiting.")
+            if not output_folder or not save_folder:
+                logging.error("output_folder or save_folder not defined in hparams.")
+                return
+
+            logging.info(f"Creating output directories: {output_folder}, {save_folder}")
+            os.makedirs(output_folder, exist_ok=True)
+            os.makedirs(save_folder, exist_ok=True)
+            logging.info("Output directories created successfully")
+
+            sb.utils.seed.seed_everything(hparams.get("seed", 1234))
+            logging.info(f"Set random seed to {hparams.get('seed', 1234)}")
+        except Exception as e:
+            logging.error(f"Error in initial setup or seed setting: {e}", exc_info=True)
+            raise
+
+        # --- Load Main Dataset ---
+        raw_datasets = None
+        hf_dataset_id = hparams.get("hf_dataset_id")
+        if not hf_dataset_id: logging.error("`hf_dataset_id` not found in hparams."); return
+        try:
+            logging.info(f"Loading HF dataset: {hf_dataset_id}")
+            raw_datasets = load_dataset(hf_dataset_id, cache_dir=CACHE_DIR)
+            logging.info(f"Raw datasets loaded:{raw_datasets}")
+        except FileNotFoundError:
+            logging.error(f"Dataset {hf_dataset_id} not found or cache dir issue."); return
+        except Exception as e:
+            logging.error(f"Error loading main dataset {hf_dataset_id}: {e}"); return
+
+        # --- Add duration if missing ---
+        def add_duration(batch):
+            duration = 0.0
+            try:
+                audio_data = batch.get("audio")
+                if audio_data and isinstance(audio_data, dict):
+                    array = audio_data.get("array")
+                    sampling_rate = audio_data.get("sampling_rate")
+                    if array is not None and sampling_rate is not None and sampling_rate > 0:
+                        duration = len(array) / sampling_rate
+                batch["duration"] = duration
+            except Exception as e: logging.warning(f"Could not calculate duration: {e}. Setting to {duration}."); batch["duration"] = duration
+            return batch
+
+        try:
+            for split in raw_datasets:
+                if 'duration' not in raw_datasets[split].column_names:
+                    logging.info(f"Calculating duration for split: {split}")
+                    try:
+                        num_proc = min(os.cpu_count() if os.cpu_count() else 1, 4)
+                        raw_datasets[split] = raw_datasets[split].map(add_duration, num_proc=num_proc)
+                    except Exception as map_e:
+                        logging.warning(f"Error calculating durations (multi-proc): {map_e}. Trying single process.")
+                        raw_datasets[split] = raw_datasets[split].map(add_duration)
+        except Exception as e: logging.error(f"Error processing dataset durations: {e}")
+
+        # --- Instantiate Modules, Optimizer, Scheduler ---
+        whisper_model = modules = optimizer = lr_scheduler = None
+        try:
+            logging.info("Initializing model, optimizer, scheduler...")
+            whisper_model = Whisper(
+                source=hparams.get("whisper_hub"), save_path=save_folder, encoder_only=False,
+                language=hparams.get("language"), task=hparams.get("task")
+            )
+            modules = {"whisper": whisper_model}
+            no_decay = ['bias', 'LayerNorm.weight', 'layer_norm.weight']
+            params = [
+                {'params': [p for n, p in modules["whisper"].named_parameters() if p.requires_grad and not any(nd in n for nd in no_decay)],
+                 'weight_decay': hparams.get("weight_decay", 0.05), 'lr': hparams.get("learning_rate", 1e-7)},
+                {'params': [p for n, p in modules["whisper"].named_parameters() if p.requires_grad and any(nd in n for nd in no_decay)],
+                 'weight_decay': 0.0, 'lr': hparams.get("learning_rate", 1e-7)}
+            ]
+            optimizer = optim.AdamW(
+                params=params,
+                lr=hparams.get("learning_rate", 1e-7),
+                betas=(0.9, 0.999),
+                eps=1e-8,
+                weight_decay=hparams.get("weight_decay", 0.05)
+            )
+            lr_scheduler = sb.nnet.schedulers.NewBobScheduler(
+                initial_value=hparams.get("learning_rate"), improvement_threshold=hparams.get("lr_improvement_threshold", 0.0025),
+                annealing_factor=hparams.get("lr_annealing_factor"), patient=hparams.get("lr_patient", 0)
+            )
+            logging.info("Model, optimizer, scheduler initialized.")
+        except KeyError as e: logging.error(f"Missing critical hparam for setup: {e}"); return
+        except Exception as e: logging.error(f"Error initializing model/optimizer/scheduler: {e}", exc_info=True); return
+
+        # --- Checkpointer and Logger Setup --- 
+        epoch_counter = checkpointer = train_logger = None
+        try:
+            epoch_counter = sb.utils.epoch_loop.EpochCounter(limit=hparams.get("epochs"))
+            checkpointer = sb.utils.checkpoints.Checkpointer(
+                checkpoints_dir=save_folder,
+                recoverables={ "model": modules["whisper"], "scheduler": lr_scheduler, "counter": epoch_counter, "optimizer": optimizer, },
+            )
+
+            # --- Use Unconditional FileTrainLogger --- 
+            train_logger = FileTrainLogger(save_file=os.path.join(output_folder, "train_log.txt"))
+            hparams["train_logger"] = train_logger # Assign the logger
+            logging.info("Initialized FileTrainLogger.")
+
+        except KeyError as e: 
+            logging.error(f"Missing critical hparam for checkpointer/logger setup: {e}")
+
+        # --- Create Datasets ---
+        logging.info("Creating SpeechBrain DynamicItemDatasets...")
+        datasets_dict = {}
+        output_keys = ["id", "signal_raw", "text_raw", "duration"]
+        try:
+            required_splits = [hparams.get("train_split"), hparams.get("valid_split"), hparams.get("test_split")]
+            required_splits = [s for s in required_splits if s]
+            if not required_splits: logging.error("No dataset split names defined in hparams."); return
+            for split in required_splits:
+                if split in raw_datasets:
+                    dynamic_items = [audio_pipeline_minimal, text_pipeline_minimal]
+                    hf_dataset_split = raw_datasets[split]
+                    data_dict = {str(i): hf_dataset_split[i] for i in range(len(hf_dataset_split))}
+                    datasets_dict[split] = DynamicItemDataset(
+                         data=data_dict, dynamic_items=dynamic_items, output_keys=output_keys,
+                    )
+                    logging.info(f"Successfully created DynamicItemDataset for split: {split} with {len(datasets_dict[split])} items.")
+                else:
+                     logging.warning(f"Split '{split}' not found in loaded dataset. Skipping.")
+            if not hparams.get("train_split") in datasets_dict or not hparams.get("valid_split") in datasets_dict:
+                 logging.error("Essential train or validation dataset could not be created. Exiting.")
+                 return
+        except Exception as e:
+             logging.error(f"Error creating DynamicItemDatasets: {e}", exc_info=True)
              return
 
-    except Exception as e:
-         logging.error(f"Error creating DynamicItemDatasets: {e}", exc_info=True)
-         return
-
-
-    # --- Dataloader Kwargs and Samplers ---
-    logging.info("Creating Dataloaders with DynamicBatchSampler...")
-    train_loader_kwargs = valid_loader_kwargs = test_loader_kwargs = None
-    try:
-        dynamic_batching = hparams.get("batch_size_dynamic", True)
-
-        loader_common_kwargs = {
-            "num_workers": hparams.get("num_workers", 0),
-            "pin_memory": True if hparams.get("num_workers", 0) > 0 else False,
-            "prefetch_factor": 2 if hparams.get("num_workers", 0) > 0 else None,
-            "collate_fn": PaddedBatch,
-        }
-
-        if dynamic_batching:
-            max_batch_length_samples = int(hparams.get("max_batch_len_seconds") * hparams.get("target_sample_rate"))
-
-            def length_func(item_dict):
-                duration = item_dict.get("duration")
-                if duration is None or not isinstance(duration, (int, float)) or duration < 0: return 0
-                return math.ceil(duration * hparams.get("target_sample_rate"))
-
-            # DynamicBatchSampler settings
-            train_split_name = hparams.get("train_split")
-            if train_split_name and train_split_name in datasets_dict:
-                train_sampler = DynamicBatchSampler(datasets_dict[train_split_name], max_batch_length=max_batch_length_samples, num_buckets=100, shuffle=True, batch_ordering="random", length_func=length_func)
-                train_loader_kwargs = { **loader_common_kwargs, "batch_sampler": train_sampler, "shuffle": False }
-            if hparams.get("valid_split") in datasets_dict:
-                valid_sampler = DynamicBatchSampler(datasets_dict[hparams.get("valid_split")], max_batch_length=max_batch_length_samples, num_buckets=100, shuffle=False, batch_ordering="random", length_func=length_func)
-                valid_loader_kwargs = { **loader_common_kwargs, "batch_sampler": valid_sampler, "shuffle": False }
-            if hparams.get("test_split") in datasets_dict:
-                test_sampler = DynamicBatchSampler(datasets_dict[hparams.get("test_split")], max_batch_length=max_batch_length_samples, num_buckets=100, shuffle=False, batch_ordering="random", length_func=length_func)
-                test_loader_kwargs = { **loader_common_kwargs, "batch_sampler": test_sampler, "shuffle": False }
-        else:
-            static_bs = hparams.get("loader_batch_size", 8)
-            loader_common_kwargs["batch_size"] = static_bs
-
-            if hparams.get("train_split") in datasets_dict:
-                train_loader_kwargs = { **loader_common_kwargs, "shuffle": True }
-            if hparams.get("valid_split") in datasets_dict:
-                valid_loader_kwargs = { **loader_common_kwargs, "shuffle": False }
-            if hparams.get("test_split") in datasets_dict:
-                test_loader_kwargs = { **loader_common_kwargs, "shuffle": False }
-
-        # Check if essential loaders were created
-        if not train_loader_kwargs or not valid_loader_kwargs:
-            logging.error("Essential train or validation loader could not be created. Exiting.")
-            return
-
-    except KeyError as e: logging.error(f"Missing critical hparam for dataloader setup: {e}"); return
-    except Exception as e: logging.error(f"Error creating Dataloaders/Samplers: {e}", exc_info=True); return
-
-
-    # --- Initialize Brain ---
-    whisper_brain = None
-    try:
-        logging.info("Initializing WhisperFineTuneBrain...")
-        # Pass scheduler/counter explicitly to hparams for Brain init if they exist
-        if lr_scheduler: hparams['lr_scheduler'] = lr_scheduler
-        if epoch_counter: hparams['epoch_counter'] = epoch_counter
-        # Ensure train_logger is in hparams, even if None
-        hparams['train_logger'] = train_logger if train_logger else None
-
-        # ---------------- run_opts with DDP -----------------
-        device_type = "cuda" if torch.cuda.is_available() else "cpu"
-        run_opts = {"device": device_type}
-        if torch.cuda.is_available() and torch.cuda.device_count() > 1:
-            run_opts.update({
-                "data_parallel_backend": "ddp",
-                "ddp_port": os.environ.get("MASTER_PORT", "29500"),
-                "ddp_init_method": "env://",
-            })
-
-        whisper_brain = WhisperFineTuneBrain(
-            modules=modules, opt_class=lambda params: optimizer, hparams=hparams, # Pass the potentially modified hparams dict
-            run_opts=run_opts, checkpointer=checkpointer
-        )
-        logging.info(f"WhisperFineTuneBrain initialized on device: {whisper_brain.device}")
-    except Exception as e: logging.error(f"Error initializing WhisperFineTuneBrain: {e}", exc_info=True); return
-
-
-    # --- Training ---
-    train_set = datasets_dict.get(hparams.get("train_split"))
-    valid_set = datasets_dict.get(hparams.get("valid_split"))
-
-    if train_set and valid_set and train_loader_kwargs and valid_loader_kwargs and epoch_counter and whisper_brain:
-        logging.info(f"Starting training loop for {getattr(epoch_counter, 'limit', 'N/A')} epochs...")
+        # --- Dataloader Kwargs and Samplers ---
+        logging.info("Creating Dataloaders with DynamicBatchSampler...")
+        train_loader_kwargs = valid_loader_kwargs = test_loader_kwargs = None
         try:
-            if checkpointer:
-                 try: checkpointer.recover_if_possible(); logging.info("Attempted checkpoint recovery.")
-                 except Exception as ckpt_load_e: logging.warning(f"Could not recover checkpoint before fit: {ckpt_load_e}")
+            dynamic_batching = hparams.get("batch_size_dynamic", True)
+            loader_common_kwargs = {
+                "num_workers": hparams.get("num_workers", 0),
+                "pin_memory": True if hparams.get("num_workers", 0) > 0 else False,
+                "prefetch_factor": 2 if hparams.get("num_workers", 0) > 0 else None,
+                "collate_fn": PaddedBatch,
+            }
+            if dynamic_batching:
+                max_batch_length_samples = int(hparams.get("max_batch_len_seconds") * hparams.get("target_sample_rate"))
+                def length_func(item_dict):
+                    duration = item_dict.get("duration")
+                    if duration is None or not isinstance(duration, (int, float)) or duration < 0: return 0
+                    return math.ceil(duration * hparams.get("target_sample_rate"))
+                train_split_name = hparams.get("train_split")
+                if train_split_name and train_split_name in datasets_dict:
+                    train_sampler = DynamicBatchSampler(datasets_dict[train_split_name], max_batch_length=max_batch_length_samples, num_buckets=100, shuffle=True, batch_ordering="random", length_func=length_func)
+                    train_loader_kwargs = { **loader_common_kwargs, "batch_sampler": train_sampler, "shuffle": False }
+                if hparams.get("valid_split") in datasets_dict:
+                    valid_sampler = DynamicBatchSampler(datasets_dict[hparams.get("valid_split")], max_batch_length=max_batch_length_samples, num_buckets=100, shuffle=False, batch_ordering="random", length_func=length_func)
+                    valid_loader_kwargs = { **loader_common_kwargs, "batch_sampler": valid_sampler, "shuffle": False }
+                if hparams.get("test_split") in datasets_dict:
+                    test_sampler = DynamicBatchSampler(datasets_dict[hparams.get("test_split")], max_batch_length=max_batch_length_samples, num_buckets=100, shuffle=False, batch_ordering="random", length_func=length_func)
+                    test_loader_kwargs = { **loader_common_kwargs, "batch_sampler": test_sampler, "shuffle": False }
+            else:
+                static_bs = hparams.get("loader_batch_size", 8)
+                loader_common_kwargs["batch_size"] = static_bs
+                if hparams.get("train_split") in datasets_dict:
+                    train_loader_kwargs = { **loader_common_kwargs, "shuffle": True }
+                if hparams.get("valid_split") in datasets_dict:
+                    valid_loader_kwargs = { **loader_common_kwargs, "shuffle": False }
+                if hparams.get("test_split") in datasets_dict:
+                    test_loader_kwargs = { **loader_common_kwargs, "shuffle": False }
+            if not train_loader_kwargs or not valid_loader_kwargs:
+                logging.error("Essential train or validation loader could not be created. Exiting.")
+                return
+        except KeyError as e: logging.error(f"Missing critical hparam for dataloader setup: {e}"); return
+        except Exception as e: logging.error(f"Error creating Dataloaders/Samplers: {e}", exc_info=True); return
 
-            whisper_brain.fit(
-                epoch_counter=epoch_counter, train_set=train_set, valid_set=valid_set,
-                train_loader_kwargs=train_loader_kwargs, valid_loader_kwargs=valid_loader_kwargs
+        # --- Initialize Brain ---
+        whisper_brain = None
+        try:
+            logging.info("Initializing WhisperFineTuneBrain...")
+            if lr_scheduler: hparams['lr_scheduler'] = lr_scheduler
+            if epoch_counter: hparams['epoch_counter'] = epoch_counter
+            hparams['train_logger'] = train_logger if train_logger else None
+            device_type = "cuda" if torch.cuda.is_available() else "cpu"
+            run_opts = {"device": device_type}
+            if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+                run_opts.update({
+                    "data_parallel_backend": "ddp",
+                    "ddp_port": os.environ.get("MASTER_PORT", "29500"),
+                    "ddp_init_method": "env://",
+                })
+            whisper_brain = WhisperFineTuneBrain(
+                modules=modules, opt_class=lambda params: optimizer, hparams=hparams,
+                run_opts=run_opts, checkpointer=checkpointer
             )
-            logging.info("Training complete.")
-            try: volume.commit(); logging.info("Volume committed after training.")
-            except Exception as commit_e: logging.error(f"Error committing volume after training: {commit_e}")
-        except Exception as fit_e:
-             logging.error(f"Error during training loop (fit): {fit_e}", exc_info=True)
-             try: volume.commit(); logging.warning("Volume committed after training failure.")
-             except Exception as commit_e: logging.error(f"Error committing volume after training failure: {commit_e}")
-    else:
-        missing = [item for item, flag in [("train dataset", bool(train_set)), ("validation dataset", bool(valid_set)),
-                   ("train loader", bool(train_loader_kwargs)), ("validation loader", bool(valid_loader_kwargs)),
-                   ("epoch counter", bool(epoch_counter)), ("brain instance", bool(whisper_brain))] if not flag]
-        logging.warning(f"Training skipped: Missing components: {', '.join(missing)}.")
+            logging.info(f"WhisperFineTuneBrain initialized on device: {whisper_brain.device}")
+        except Exception as e: logging.error(f"Error initializing WhisperFineTuneBrain: {e}", exc_info=True); return
 
+        # --- WandB Watch Model (If enabled and wandb initialized) ---
+        # Check if wandb_run exists (meaning wandb.init was successful)
+        if wandb_run and getattr(hparams, "wandb_watch_model", False):
+             try:
+                 # Ensure wandb is available
+                 import wandb 
+                 watch_freq = getattr(hparams, "wandb_watch_freq", 100)
+                 # Watch the specific model module within the Brain class
+                 wandb.watch(whisper_brain.modules.whisper, log="gradients", log_freq=watch_freq)
+                 logging.info(f"WandB watching model gradients every {watch_freq} steps.")
+             except ImportError:
+                  logging.warning("wandb library not found, cannot watch model.")
+             except Exception as e:
+                 logging.warning(f"Could not set up wandb.watch: {e}")
+        else:
+             # Log why watch wasn't enabled
+             missing_watch_reasons = []
+             if not wandb_run: missing_watch_reasons.append("W&B run not initialized")
+             if not getattr(hparams, "wandb_watch_model", False): missing_watch_reasons.append("W&B watch disabled in hparams")
+             # No need to check brain or logger type here if W&B isn't active
+             if missing_watch_reasons: logging.info(f"Skipping wandb.watch because: {', '.join(missing_watch_reasons)}")
 
-    # --- Evaluation ---
-    test_set = datasets_dict.get(hparams.get("test_split"))
+        # --- Training ---
+        train_set = datasets_dict.get(hparams.get("train_split"))
+        valid_set = datasets_dict.get(hparams.get("valid_split"))
+        if train_set and valid_set and train_loader_kwargs and valid_loader_kwargs and epoch_counter and whisper_brain:
+            logging.info(f"Starting training loop for {getattr(epoch_counter, 'limit', 'N/A')} epochs...")
+            try:
+                if checkpointer:
+                    try: checkpointer.recover_if_possible(); logging.info("Attempted checkpoint recovery.")
+                    except Exception as ckpt_load_e: logging.warning(f"Could not recover checkpoint before fit: {ckpt_load_e}")
+                whisper_brain.fit(
+                    epoch_counter=epoch_counter, train_set=train_set, valid_set=valid_set,
+                    train_loader_kwargs=train_loader_kwargs, valid_loader_kwargs=valid_loader_kwargs
+                )
+                logging.info("Training complete.")
+                try: volume.commit(); logging.info("Volume committed after training.")
+                except Exception as commit_e: logging.error(f"Error committing volume after training: {commit_e}")
+            except Exception as fit_e:
+                 logging.error(f"Error during training loop (fit): {fit_e}", exc_info=True)
+                 try: volume.commit(); logging.warning("Volume committed after training failure.")
+                 except Exception as commit_e: logging.error(f"Error committing volume after training failure: {commit_e}")
+        else:
+            missing = [item for item, flag in [("train dataset", bool(train_set)), ("validation dataset", bool(valid_set)),
+                       ("train loader", bool(train_loader_kwargs)), ("validation loader", bool(valid_loader_kwargs)),
+                       ("epoch counter", bool(epoch_counter)), ("brain instance", bool(whisper_brain))] if not flag]
+            logging.warning(f"Training skipped: Missing components: {', '.join(missing)}.")
 
-    if test_set and test_loader_kwargs and whisper_brain:
-        logging.info("Starting final evaluation on test set...")
+        # --- Evaluation ---
+        test_set = datasets_dict.get(hparams.get("test_split"))
+        if test_set and test_loader_kwargs and whisper_brain:
+            logging.info("Starting final evaluation on test set...")
+            try:
+                if checkpointer:
+                    try: checkpointer.recover_if_possible(min_key="WER"); logging.info("Loaded best checkpoint based on validation WER.")
+                    except FileNotFoundError: logging.warning("No checkpoint found with min_key 'WER'. Evaluating current model state.")
+                    except Exception as load_e: logging.warning(f"Could not load best checkpoint: {load_e}. Evaluating current model state.")
+                else: logging.warning("Checkpointer not available. Evaluating current model state.")
+                whisper_brain.evaluate(test_set=test_set, min_key="WER", test_loader_kwargs=test_loader_kwargs)
+                logging.info("Evaluation complete.")
+                try: volume.commit(); logging.info("Volume committed after evaluation.")
+                except Exception as commit_e: logging.error(f"Error committing volume after evaluation: {commit_e}")
+            except Exception as eval_e:
+                 logging.error(f"Error during evaluation: {eval_e}", exc_info=True)
+                 try: volume.commit(); logging.warning("Volume committed after evaluation failure.")
+                 except Exception as commit_e: logging.error(f"Error committing volume after evaluation failure: {commit_e}")
+        else:
+            missing = [item for item, flag in [("test dataset", bool(test_set)),
+                       ("test loader", bool(test_loader_kwargs)), ("brain instance", bool(whisper_brain))] if not flag]
+            logging.warning(f"Evaluation skipped: Missing components: {', '.join(missing)}.")
+
+        print("--- Modal Training Function Finished ---")
+
+    except Exception as main_e:
+        logging.error(f"Main training function failed: {main_e}", exc_info=True)
+    finally:
+        # --- Robust W&B Finish --- 
+        if wandb_run: # Only finish if init was successful and wandb_run is assigned
+            try:
+                logging.info(f"Finishing W&B run: {wandb_run.name}")
+                wandb.finish()
+            except Exception as wandb_finish_e:
+                logging.error(f"Error during wandb.finish(): {wandb_finish_e}")
+        else:
+            logging.info("W&B run was not active, skipping wandb.finish().")
+
+        # --- Commit Volume --- 
+        # This should happen regardless of W&B status
         try:
-            if checkpointer:
-                 try: checkpointer.recover_if_possible(min_key="WER"); logging.info("Loaded best checkpoint based on validation WER.")
-                 except FileNotFoundError: logging.warning("No checkpoint found with min_key 'WER'. Evaluating current model state.")
-                 except Exception as load_e: logging.warning(f"Could not load best checkpoint: {load_e}. Evaluating current model state.")
-            else: logging.warning("Checkpointer not available. Evaluating current model state.")
-
-            whisper_brain.evaluate(test_set=test_set, min_key="WER", test_loader_kwargs=test_loader_kwargs)
-            logging.info("Evaluation complete.")
-            try: volume.commit(); logging.info("Volume committed after evaluation.")
-            except Exception as commit_e: logging.error(f"Error committing volume after evaluation: {commit_e}")
-        except Exception as eval_e:
-             logging.error(f"Error during evaluation: {eval_e}", exc_info=True)
-             try: volume.commit(); logging.warning("Volume committed after evaluation failure.")
-             except Exception as commit_e: logging.error(f"Error committing volume after evaluation failure: {commit_e}")
-    else:
-        missing = [item for item, flag in [("test dataset", bool(test_set)),
-                   ("test loader", bool(test_loader_kwargs)), ("brain instance", bool(whisper_brain))] if not flag]
-        logging.warning(f"Evaluation skipped: Missing components: {', '.join(missing)}.")
-
-    print("--- Modal Training Function Finished ---")
+            volume.commit()
+            logging.info("Final volume commit attempt in finally block.")
+        except Exception as commit_e:
+            logging.error(f"Error committing volume in finally block: {commit_e}")
 
 # End of Cell 5
 
