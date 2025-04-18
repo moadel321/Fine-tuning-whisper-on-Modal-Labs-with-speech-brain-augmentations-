@@ -1,4 +1,5 @@
 import logging
+import datetime
 import yaml  # Add yaml import
 import tempfile  # Add tempfile for safe temporary file handling
 import csv  # Add csv import for augmentation file handling
@@ -7,6 +8,10 @@ import math
 import torch.nn.functional as F
 from speechbrain.processing.signal_processing import compute_amplitude, dB_to_amplitude, reverberate
 from datasets import load_dataset  # Global import for dataset loading in Brain
+
+# Turn off tokenizers parallelism warnings
+import os
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 # Full Corrected Script V4 (Fix SimpleNamespace error, Add Gradient Clipping)
 
@@ -108,14 +113,16 @@ modal_image = (
         # Core ML libraries
         "torch==2.1.2",  # Latest stable that's well-tested with Whisper
         "torchaudio==2.1.2",  # Matching torch version
-        "transformers==4.36.2",  # Latest stable with good Whisper support
+        "torchvision==0.16.2", # Add torchvision, compatible with torch 2.1.2
+        "transformers==4.51.3",  # Use latest
         "accelerate==0.25.0",  # Latest stable
+        "wandb",  # <-- ADD WANDB HERE
         # SpeechBrain and audio processing
-        "speechbrain==1.0.2",  # Latest stable
+        "speechbrain==1.0.3",  # Latest stable
         "librosa==0.10.1",  # Latest stable
         # Hugging Face ecosystem
         "datasets==2.16.1",  # Latest stable
-        "huggingface_hub==0.20.3",  # Latest stable
+        "huggingface_hub==0.30.0",  # Latest stable
         "sentencepiece==0.1.99",  # Latest stable
         # Additional dependencies
         "num2words==0.5.13",
@@ -127,6 +134,18 @@ modal_image = (
 
 print("Modal App basics defined (using modal.Volume.from_name).")
 # End of Cell 1
+ 
+# Ensure persistent Hugging Face cache inside the volume
+CHECKPOINT_DIR = "/root/checkpoints"  # Mount point inside container (defined above)
+CACHE_DIR = f"{CHECKPOINT_DIR}/hf_cache"  # Persistent HF cache stored in Modal volume
+
+# Create the cache directory if it doesn't exist yet
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+# Redirect common HF cache environment variables to this persistent location
+os.environ["HF_HOME"] = CACHE_DIR
+os.environ["HF_DATASETS_CACHE"] = CACHE_DIR
+os.environ["HF_HUB_CACHE"] = CACHE_DIR
 
 # Cell 2: Define Hyperparameters (Updated with correct token IDs)
 
@@ -709,7 +728,7 @@ class WhisperFineTuneBrain(sb.Brain):
                  dummy_wav_lens = torch.zeros(bsz, device=self.device)
                  return dummy_log_probs, None, dummy_wav_lens
 
-            enc_out, logits, _ = self.modules.whisper(wavs, tokens_bos)
+            enc_out, logits, hyps = self.modules.whisper(wavs, tokens_bos)
 
             # Directly compute log_softmax
             log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
@@ -718,21 +737,18 @@ class WhisperFineTuneBrain(sb.Brain):
             if not torch.all(torch.isfinite(log_probs)):
                 logging.error("NaN/Inf detected AFTER log_softmax. Loss will likely be NaN. Check model internal stability.")
 
-            hyps = None
+            # --- Simple Greedy Decoding for evaluation ---
+            hyps_out = None
             if stage != sb.Stage.TRAIN:
                 try:
-                    with torch.no_grad():
-                         hyps, _ = self.modules.whisper.generate(
-                             wavs,
-                             task=getattr(self.hparams, "task", "transcribe"),
-                             language=getattr(self.hparams, "language", "ar"),
-                             num_beams=getattr(self.hparams, "num_beams", 1),
-                         )
-                except Exception as gen_e:
-                     logging.error(f"Error during whisper.generate: {gen_e}", exc_info=True)
-                     hyps = None
+                    # Greedy selection of most probable token at each timestep
+                    pred_tokens = torch.argmax(logits, dim=-1)  # [B, T]
+                    hyps_out = pred_tokens.detach().cpu().tolist()  # Convert to list for tokenizer.decode
+                except Exception as dec_e:
+                    logging.error(f"Error during greedy decoding: {dec_e}")
+                    hyps_out = None
 
-            return log_probs, hyps, wav_lens.to(self.device)
+            return log_probs, hyps_out, wav_lens.to(self.device)
 
         except Exception as e:
              logging.error(f"Error in compute_forward: {e}", exc_info=True)
@@ -770,24 +786,27 @@ class WhisperFineTuneBrain(sb.Brain):
                 return torch.tensor(0.0, device=self.device, requires_grad=False)
 
             # --- Calculate Loss ---
+            loss = torch.tensor(0.0, device=self.device, requires_grad=stage==sb.Stage.TRAIN)
             try:
-                 use_lengths = (isinstance(tokens_eos_lens_rel, torch.Tensor) and
-                                tokens_eos_lens_rel.numel() > 0 and
-                                torch.all(tokens_eos_lens_rel > 0))
+                use_lengths = (isinstance(tokens_eos_lens_rel, torch.Tensor) and
+                               tokens_eos_lens_rel.numel() > 0 and
+                               torch.all(tokens_eos_lens_rel > 0))
 
-                 if use_lengths:
-                      loss = sb.nnet.losses.nll_loss(log_probs, tokens_eos_padded, length=tokens_eos_lens_rel)
-                 else:
-                      logging.warning("Invalid target lengths for NLL loss. Using full padded length.")
-                      loss = sb.nnet.losses.nll_loss(log_probs, tokens_eos_padded)
+                if use_lengths:
+                    logging.debug(f"Calling nll_loss with log_probs shape {log_probs.shape} and target shape {tokens_eos_padded.shape}, length tensor shape {tokens_eos_lens_rel.shape}")
+                    loss = sb.nnet.losses.nll_loss(log_probs, tokens_eos_padded, length=tokens_eos_lens_rel)
+                else:
+                    logging.debug(f"Calling nll_loss (no length) with log_probs shape {log_probs.shape} and target shape {tokens_eos_padded.shape}")
+                    logging.warning("Invalid target lengths for NLL loss. Using full padded length.")
+                    loss = sb.nnet.losses.nll_loss(log_probs, tokens_eos_padded)
 
-                 if not torch.isfinite(loss):
-                      logging.error("NaN or Inf loss calculated. Log Probs finite: {}, Targets: {}. Returning zero loss.".format(torch.all(torch.isfinite(log_probs)), tokens_eos_padded.shape))
-                      loss = torch.tensor(0.0, device=self.device, requires_grad=stage==sb.Stage.TRAIN)
+                if not torch.isfinite(loss):
+                    logging.error("NaN or Inf loss calculated. Log Probs finite: {}, Targets: {}. Returning zero loss.".format(torch.all(torch.isfinite(log_probs)), tokens_eos_padded.shape))
+                    loss = torch.tensor(0.0, device=self.device, requires_grad=stage==sb.Stage.TRAIN)
 
             except Exception as loss_e:
-                 logging.error(f"Error calculating NLL loss: {loss_e}")
-                 loss = torch.tensor(0.0, device=self.device, requires_grad=stage==sb.Stage.TRAIN)
+                logging.error(f"Error calculating NLL loss: {loss_e}")
+                loss = torch.tensor(0.0, device=self.device, requires_grad=stage==sb.Stage.TRAIN)
 
             # --- Calculate Metrics (WER/CER) ---
             if stage != sb.Stage.TRAIN and hyps is not None:
@@ -829,43 +848,56 @@ class WhisperFineTuneBrain(sb.Brain):
         except Exception as e: logging.error(f"Error initializing metrics for stage {stage}: {e}")
 
 
-    # --- on_stage_end (Using getattr for hparams access) ---
+    # --- on_stage_end (Corrected Logic) ---
     def on_stage_end(self, stage, stage_loss, epoch):
         try:
-            stage_stats = {"loss": stage_loss}
+            # --- Get current LR ---
             current_lr = 'N/A'
             if hasattr(self, 'optimizer') and self.optimizer and hasattr(self.optimizer, 'param_groups') and self.optimizer.param_groups:
                  try: current_lr = self.optimizer.param_groups[0]['lr']
                  except: logging.warning("Could not retrieve learning rate.")
 
-            wer = cer = None
-            try:
-                if stage == sb.Stage.VALID or stage == sb.Stage.TEST:
-                     wer = self.wer_metric.summarize("error_rate")
-                     cer = self.cer_metric.summarize("error_rate")
-                     stage_stats["WER"] = wer if isinstance(wer, (int, float)) else float('inf')
-                     stage_stats["CER"] = cer if isinstance(cer, (int, float)) else float('inf')
-            except Exception as e:
-                 logging.error(f"Error summarizing WER/CER metrics for stage {stage}: {e}")
-                 stage_stats["WER"] = stage_stats["CER"] = float('inf')
+            # === Store Train Loss when TRAIN stage ends ===
+            if stage == sb.Stage.TRAIN:
+                # Store the calculated train loss in a temporary variable
+                # self.avg_train_loss will be reset by Brain.fit() right after this returns
+                self._current_epoch_train_loss = getattr(self, 'avg_train_loss', 0.0)
+                print(f"--- PRINT DEBUG on_stage_end(TRAIN): Storing train_loss = {self._current_epoch_train_loss} ---", file=sys.stderr, flush=True)
+                # No further logging needed here for the TRAIN stage itself
 
-
-            if stage == sb.Stage.VALID:
+            # === Log metrics when VALID stage ends ===
+            elif stage == sb.Stage.VALID:
+                stage_stats = {"loss": stage_loss}
+                wer = cer = None
                 try:
-                    train_loss_val = getattr(self, 'avg_train_loss', 'N/A')
-                    # ***** Use getattr for hparams access *****
+                    # Calculate WER/CER as before
+                    wer = self.wer_metric.summarize("error_rate")
+                    cer = self.cer_metric.summarize("error_rate")
+                    stage_stats["WER"] = wer if isinstance(wer, (int, float)) else float('inf')
+                    stage_stats["CER"] = cer if isinstance(cer, (int, float)) else float('inf')
+                except Exception as e:
+                    logging.error(f"Error summarizing WER/CER metrics: {e}")
+                    stage_stats["WER"] = stage_stats["CER"] = float('inf')
+
+                try:
+                    # Retrieve the *stored* train loss from the end of the TRAIN stage
+                    train_loss_to_log = getattr(self, '_current_epoch_train_loss', 'N/A_MISSING')
+                    print(f"--- PRINT DEBUG on_stage_end(VALID): Using stored train_loss = {train_loss_to_log} for logging ---", file=sys.stderr, flush=True)
+
                     train_logger = getattr(self.hparams, "train_logger", None)
                     if train_logger:
                         train_logger.log_stats(
                             stats_meta={"epoch": epoch, "lr": current_lr},
-                            train_stats={'loss': train_loss_val},
+                            # Use the stored value here!
+                            train_stats={'loss': train_loss_to_log},
                             valid_stats=stage_stats,
                         )
                     else:
                         logging.warning("Train logger not available for logging validation stats.")
-                except Exception as e: logging.error(f"Error logging validation stats: {e}")
+                except Exception as e:
+                    logging.error(f"Error logging validation stats: {e}")
 
-                # ***** Use getattr for hparams access *****
+                # --- Checkpointing (using validation WER) ---
                 num_to_keep = getattr(self.hparams, "num_checkpoints_to_keep", 1)
                 if wer is not None and math.isfinite(wer) and hasattr(self, 'checkpointer') and self.checkpointer:
                     try:
@@ -901,12 +933,13 @@ class WhisperFineTuneBrain(sb.Brain):
 
         except Exception as e: logging.error(f"Error in on_stage_end for stage {stage}: {e}", exc_info=True)
 
-    # --- on_fit_start (Unchanged from V3) ---
+    # --- on_fit_start (Updated with temporary variable) ---
     def on_fit_start(self):
         try:
             super().on_fit_start()
-            self.avg_train_loss = 0.0
+            self.avg_train_loss = 0.0 # Still needed for on_train_epoch_end
             self._train_loss_buffer = []
+            self._current_epoch_train_loss = 0.0 # Initialize the new variable
             logging.info("Fit started, initialized train loss tracking.")
         except Exception as e: logging.error(f"Error in on_fit_start: {e}")
 
@@ -932,7 +965,7 @@ class WhisperFineTuneBrain(sb.Brain):
         # Apply learning rate warmup if we're in warmup phase
         if self.step_counter < warmup_steps and hasattr(self, 'optimizer'):
             warmup_factor = self.step_counter / max(1, warmup_steps)
-            base_lr = getattr(self.hparams, "learning_rate", 1e-7)
+            base_lr = getattr(self.hparams, "learning_rate", 1e-5)
             for param_group in self.optimizer.param_groups:
                 param_group['lr'] = base_lr * warmup_factor
             if self.step_counter % 100 == 0:  # Log occasionally
@@ -969,13 +1002,42 @@ class WhisperFineTuneBrain(sb.Brain):
             # --- Standard Gradient Clipping & Optimizer Step ---
             if should_step and torch.isfinite(loss) and loss.requires_grad: # Only step if backward was likely successful
                 try:
-                    # Single, standard gradient clipping step
-                    max_norm = getattr(self.hparams, "max_grad_norm", 1.0) # Start with 1.0 or 5.0
-                    torch.nn.utils.clip_grad_norm_(self.modules.parameters(), max_norm)
+                    # ----------------------------------------------------
+                    # Verbose gradient‑norm diagnostics (detect explosions)
+                    # ----------------------------------------------------
+                    try:
+                        total_norm_sq = 0.0
+                        max_norm_val = 0.0
+                        max_norm_name = None
+                        for n, p in self.modules.named_parameters():
+                            if p.grad is not None:
+                                param_norm = p.grad.data.norm(2).item()
+                                total_norm_sq += param_norm ** 2
+                                if param_norm > max_norm_val:
+                                    max_norm_val = param_norm
+                                    max_norm_name = n
+                        total_grad_norm = math.sqrt(total_norm_sq)
+                        logging.info(
+                            f"Step {self.step}: total grad L2 = {total_grad_norm:.3f}; "
+                            f"max single‑param grad norm = {max_norm_val:.3f} ({max_norm_name})"
+                        )
+                    except Exception as gn_e:
+                        logging.warning(f"Could not compute gradient norms: {gn_e}")
 
-                    # Optimizer step
-                    self.optimizer.step()
-                    self.optimizer.zero_grad(set_to_none=True) # Use set_to_none for efficiency
+                    try:
+                        # Single, standard gradient clipping step
+                        max_norm = getattr(self.hparams, "max_grad_norm", 1.0) # Start with 1.0 or 5.0
+                        torch.nn.utils.clip_grad_norm_(self.modules.parameters(), max_norm)
+
+                        # Optimizer step
+                        self.optimizer.step()
+                        self.optimizer.zero_grad(set_to_none=True) # Use set_to_none for efficiency
+
+                    except Exception as e:
+                        logging.error(f"Error during optimizer step/clipping/zero_grad: {e}")
+                        try:
+                            if self.optimizer: self.optimizer.zero_grad(set_to_none=True)
+                        except Exception as zg_e: logging.error(f"Error during zero_grad after step error: {zg_e}")
 
                 except Exception as e:
                     logging.error(f"Error during optimizer step/clipping/zero_grad: {e}")
@@ -984,6 +1046,12 @@ class WhisperFineTuneBrain(sb.Brain):
                     except Exception as zg_e: logging.error(f"Error during zero_grad after step error: {zg_e}")
 
             # Accumulate loss for logging (even if step was skipped)
+            try:
+                loss_value = loss.detach().item() if isinstance(loss, torch.Tensor) else float(loss)
+                logging.info(f"Appending batch loss to buffer: {loss_value:.6f}")
+            except Exception as _log_exc:
+                logging.warning(f"Could not log batch loss value: {_log_exc}")
+
             self._train_loss_buffer.append(loss.detach().item())
 
         except Exception as e:
@@ -992,20 +1060,78 @@ class WhisperFineTuneBrain(sb.Brain):
 
         return loss.detach().cpu()
 
-    # --- on_train_epoch_end (Unchanged from V3) ---
+    # --- on_train_epoch_end (WITH FILE DEBUGGING) ---
     def on_train_epoch_end(self, epoch):
+        # Define a debug file path (use /tmp which is usually writable)
+        debug_file_path = f"/tmp/epoch_{epoch}_debug.txt"
         try:
+            # === START: Write to debug file ===
+            with open(debug_file_path, "a") as f: # Open in append mode
+                f.write(f"--- DEBUG FILE: Entering on_train_epoch_end for epoch {epoch} ---\n")
+                buffer_len_debug = len(self._train_loss_buffer)
+                f.write(f"DEBUG FILE: Current self._train_loss_buffer length = {buffer_len_debug}\n")
+
+                if self._train_loss_buffer:
+                    f.write(f"DEBUG FILE: Buffer content sample (first 5): {self._train_loss_buffer[:5]}\n")
+                    f.write(f"DEBUG FILE: Buffer content sample (last 5): {self._train_loss_buffer[-5:]}\n")
+                    try:
+                        buffer_sum = sum(self._train_loss_buffer)
+                        buffer_len = len(self._train_loss_buffer)
+                        f.write(f"DEBUG FILE: Calculated buffer sum = {buffer_sum}\n")
+                        f.write(f"DEBUG FILE: Calculated buffer len = {buffer_len}\n")
+                        if buffer_len > 0:
+                            calculated_avg = buffer_sum / buffer_len
+                            f.write(f"DEBUG FILE: Calculated average (sum/len) = {calculated_avg:.6f}\n")
+                        else:
+                            f.write("DEBUG FILE WARNING: Buffer length is zero inside 'if self._train_loss_buffer' block.\n")
+                    except Exception as e_calc:
+                         f.write(f"DEBUG FILE ERROR: Error during sum/avg calculation: {e_calc}\n")
+                else:
+                     f.write("DEBUG FILE WARNING: self._train_loss_buffer is empty or evaluates to False.\n")
+            # === END: Write to debug file ===
+
+            # --- Original logic ---
             if not self._train_loss_buffer:
                 self.avg_train_loss = 0.0
-                logging.info(f"Epoch {epoch} ended. No batches processed.")
+                logging.info(f"Epoch {epoch} ended. Assigning avg_train_loss = 0.0 because buffer was empty.") # Keep INFO log
             else:
-                self.avg_train_loss = sum(self._train_loss_buffer) / len(self._train_loss_buffer)
-                logging.info(f"Epoch {epoch} ended. Average train loss: {self.avg_train_loss:.4f}")
+                # Assign the average
+                try:
+                    buffer_len = len(self._train_loss_buffer)
+                    if buffer_len > 0:
+                        self.avg_train_loss = sum(self._train_loss_buffer) / buffer_len
+                        logging.info(f"Epoch {epoch} ended. Assigning Average train loss: {self.avg_train_loss:.4f}") # Keep INFO log
+                    else:
+                        logging.warning(f"Epoch {epoch}: Reached 'else' block but buffer length is {buffer_len}. Assigning 0.0.") # Keep WARN log
+                        self.avg_train_loss = 0.0
+                except Exception as assign_e:
+                     logging.error(f"Epoch {epoch}: Error calculating/assigning avg_train_loss in 'else' block: {assign_e}. Assigning 0.0.", exc_info=True) # Keep ERROR log
+                     self.avg_train_loss = 0.0
+
+            # --- Final check log (write to file) ---
+            with open(debug_file_path, "a") as f:
+                f.write(f"DEBUG FILE: Final value of self.avg_train_loss before clearing buffer = {self.avg_train_loss}\n")
+
+            # --- Original buffer clearing ---
             self._train_loss_buffer = []
+            with open(debug_file_path, "a") as f:
+                f.write(f"DEBUG FILE: Cleared _train_loss_buffer for epoch {epoch}.\n")
+            logging.info(f"Debug file written to {debug_file_path}") # Log that the file *should* have been written
+
         except Exception as e:
-             logging.error(f"Error in on_train_epoch_end: {e}")
+             # Log the main exception normally
+             logging.error(f"Error in on_train_epoch_end for epoch {epoch}: {e}", exc_info=True)
+             # Also write to debug file
+             try:
+                 with open(debug_file_path, "a") as f:
+                     f.write(f"DEBUG FILE CRITICAL ERROR in on_train_epoch_end: {e}\n")
+             except Exception: pass # Avoid errors during error handling
              self.avg_train_loss = 0.0
              self._train_loss_buffer = []
+             try:
+                 with open(debug_file_path, "a") as f:
+                     f.write(f"DEBUG FILE: Cleared _train_loss_buffer after CRITICAL ERROR for epoch {epoch}.\n")
+             except Exception: pass
 
     # --- on_evaluate_end (Using getattr for hparams access) ---
     def on_evaluate_end(self, avg_valid_loss, valid_stats):
@@ -1044,7 +1170,7 @@ logging.info("Defining Modal training function...")
 
 @app.function(
     image=modal_image,
-    gpu="H100",
+    gpu="H100", 
     cpu=8,
     volumes={CHECKPOINT_DIR: volume},
     secrets=[hf_secret],
@@ -1082,7 +1208,7 @@ def train_whisper_on_modal():
         from speechbrain.dataio.dataloader import SaveableDataLoader
         from speechbrain.dataio.batch import PaddedBatch
         from speechbrain.dataio.sampler import DynamicBatchSampler
-        from speechbrain.utils.distributed import run_on_main
+        from speechbrain.utils.distributed import run_on_main, ddp_init_group
         from speechbrain.lobes.models.huggingface_transformers.whisper import Whisper
         logging.info("SpeechBrain components imported successfully")
         
@@ -1317,9 +1443,19 @@ def train_whisper_on_modal():
         # Ensure train_logger is in hparams, even if None
         hparams['train_logger'] = train_logger if train_logger else None
 
+        # ---------------- run_opts with DDP -----------------
+        device_type = "cuda" if torch.cuda.is_available() else "cpu"
+        run_opts = {"device": device_type}
+        if torch.cuda.is_available() and torch.cuda.device_count() > 1:
+            run_opts.update({
+                "data_parallel_backend": "ddp",
+                "ddp_port": os.environ.get("MASTER_PORT", "29500"),
+                "ddp_init_method": "env://",
+            })
+
         whisper_brain = WhisperFineTuneBrain(
             modules=modules, opt_class=lambda params: optimizer, hparams=hparams, # Pass the potentially modified hparams dict
-            run_opts={"device": "cuda" if torch.cuda.is_available() else "cpu"}, checkpointer=checkpointer
+            run_opts=run_opts, checkpointer=checkpointer
         )
         logging.info(f"WhisperFineTuneBrain initialized on device: {whisper_brain.device}")
     except Exception as e: logging.error(f"Error initializing WhisperFineTuneBrain: {e}", exc_info=True); return
