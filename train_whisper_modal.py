@@ -7,6 +7,8 @@ import shutil  # For cleanup
 import math
 import torch.nn.functional as F
 from speechbrain.processing.signal_processing import compute_amplitude, dB_to_amplitude, reverberate
+from speechbrain.lobes.augment import TimeDomainSpecAugment
+
 from datasets import load_dataset  # Global import for dataset loading in Brain
 
 # Turn off tokenizers parallelism warnings
@@ -182,13 +184,13 @@ hparams = {
 
     # Augmentation Params
     "augment": True,
-    "noise_prob": 0.50,  # Increased
-    "reverb_prob": 0.30, # Increased
-    "speed_prob": 0.50,  # Increased
-    "pitch_prob": 0.30,  # Increased (Manual)
-    "gain_prob": 0.50,   # Increased (Manual)
+    "noise_prob": 0.50,
+    "reverb_prob": 0.30,
+    "speed_prob": 0.50,
+    "pitch_prob": 0.30,
+    "gain_prob": 0.50,
     "min_augmentations": 1,
-    "max_augmentations": 3,  # Increased - Allow combinations
+    "max_augmentations": 1,  # Critical change - single augmentation
     "noise_snr_low": 15,    # Keep severity mild for now
     "noise_snr_high": 25,
     "speed_factors": [95, 105], # Keep severity mild for now
@@ -199,16 +201,18 @@ hparams = {
 
     # Training Params
     "seed": 1986,
-    "epochs": 5,
+    "epochs": 10,
     "learning_rate": 5e-7,
     "lr_warmup_steps": 1000,
     "weight_decay": 0.05,
     "lr_annealing_factor": 0.9,
+    "lr_improvement_threshold": 0.001,
+    "lr_patient": 2,
     "batch_size_dynamic": False,
     "loader_batch_size": 8,
     "max_batch_len_seconds": 5.0,
     "num_workers": 4,
-    "grad_accumulation_factor": 2,
+    "grad_accumulation_factor": 4,
     "max_grad_norm": 5.0,
 
     # Checkpointing
@@ -216,7 +220,7 @@ hparams = {
     "num_checkpoints_to_keep": 2,
 
     # Whisper decoding params
-    "num_beams": 3,
+    "num_beams": 5,
 
     # === W&B Configuration ===
     "use_wandb": True,  # Flag to enable/disable easily
@@ -533,6 +537,21 @@ class WhisperFineTuneBrain(sb.Brain):
                 except Exception as e:
                     logging.warning(f"Could not initialize NoiseSampler: {e}. Skipping.", exc_info=True)
 
+
+            # Time‑domain SpecAugment
+            td_specaug = TimeDomainSpecAugment(
+                sample_rate=hparams["target_sample_rate"],
+                perturb_prob=0.33,
+                drop_freq_prob=0.33,
+                drop_chunk_prob=0.33,
+                drop_freq_count_low=1,
+                drop_freq_count_high=2,
+                drop_chunk_count_low=1,
+                drop_chunk_count_high=2,
+            )
+            sb_augmentations.append(td_specaug)
+            initialized_augmentations.append("TimeDomainSpecAugment")
+
             # --- Initialize RIRSampler using dataset object ---
             rir_dataset = getattr(self.hparams, "rir_dataset_object", None)
             reverb_prob = getattr(self.hparams, "reverb_prob", 0.0)
@@ -630,6 +649,20 @@ class WhisperFineTuneBrain(sb.Brain):
                     wavs = signals # Revert to original if augmentation fails
                     wav_lens = signal_lens
 
+            # Apply manual pitch and gain augmentation after SpeechBrain Augmenter
+            if stage == sb.Stage.TRAIN and getattr(self.hparams, "augment", False):
+                processed_wavs = []
+                for w in wavs:
+                    sig = w
+                    if getattr(self.hparams, "gain_prob", 0) > 0:
+                        sig = _apply_gain(sig, self.hparams.gain_prob,
+                                          self.hparams.gain_db_low, self.hparams.gain_db_high)
+                    if getattr(self.hparams, "pitch_prob", 0) > 0:
+                        sig = _apply_pitch_shift(sig, self.hparams.target_sample_rate,
+                                                 self.hparams.pitch_prob,
+                                                 self.hparams.pitch_steps_low, self.hparams.pitch_steps_high)
+                    processed_wavs.append(sig)
+                wavs = torch.stack(processed_wavs, dim=0)
 
             try:
                 tokens_list = [self.tokenizer.encode(t) for t in texts]
