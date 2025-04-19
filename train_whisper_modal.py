@@ -188,7 +188,7 @@ hparams = {
     "pitch_prob": 0.30,  # Increased (Manual)
     "gain_prob": 0.50,   # Increased (Manual)
     "min_augmentations": 1,
-    "max_augmentations": 1,  # Increased - Allow combinations
+    "max_augmentations": 1,  # Apply 1 to 3 from the pool
     "noise_snr_low": 15,    # Keep severity mild for now
     "noise_snr_high": 25,
     "speed_factors": [95, 105], # Keep severity mild for now
@@ -196,6 +196,18 @@ hparams = {
     "pitch_steps_high": 1,
     "gain_db_low": -4,     # Keep severity mild for now
     "gain_db_high": 4,
+
+    # DropChunk Params
+    "drop_chunk_prob": 0.30,
+    "drop_chunk_length_low": 1600,  # ~100ms
+    "drop_chunk_length_high": 4800, # ~300ms
+    "drop_chunk_count_low": 1,
+    "drop_chunk_count_high": 5,
+
+    # DropFreq Params
+    "drop_freq_prob": 0.30,
+    "drop_freq_count_low": 1,
+    "drop_freq_count_high": 3,
 
     # Training Params
     "seed": 1986,
@@ -317,7 +329,7 @@ print("Data Loading Pipelines defined.")
 import speechbrain as sb
 from speechbrain.utils.metric_stats import ErrorRateStats
 from speechbrain.dataio.batch import PaddedBatch
-from speechbrain.augment.time_domain import SpeedPerturb, AddNoise, AddReverb
+from speechbrain.augment.time_domain import SpeedPerturb, AddNoise, AddReverb, DropChunk, DropFreq
 from speechbrain.augment.augmenter import Augmenter
 import os
 import string
@@ -326,6 +338,39 @@ import torch.nn.utils.rnn as rnn_utils
 import math
 
 # --- Wrapper Augmentation Modules (placed before Brain class for visibility) ---
+
+# --- Wrapper for Manual Pitch Shift ---
+class PitchShiftWrapper(torch.nn.Module):
+    def __init__(self, prob, pitch_steps_low, pitch_steps_high, sample_rate):
+        super().__init__()
+        self.prob = prob
+        self.pitch_steps_low = pitch_steps_low
+        self.pitch_steps_high = pitch_steps_high
+        self.sample_rate = sample_rate
+
+    def forward(self, waveforms, lengths=None): # Match Augmenter signature
+        # Note: _apply_pitch_shift expects a single waveform, apply per item
+        processed = []
+        for wav in waveforms:
+             # The probability is handled within _apply_pitch_shift
+             processed.append(_apply_pitch_shift(wav, self.sample_rate, self.prob, self.pitch_steps_low, self.pitch_steps_high))
+        return torch.stack(processed).to(waveforms.device) # Ensure device consistency
+
+# --- Wrapper for Manual Gain --- 
+class GainWrapper(torch.nn.Module):
+    def __init__(self, prob, gain_db_low, gain_db_high):
+        super().__init__()
+        self.prob = prob
+        self.gain_db_low = gain_db_low
+        self.gain_db_high = gain_db_high
+
+    def forward(self, waveforms, lengths=None): # Match Augmenter signature
+        # Note: _apply_gain expects a single waveform, apply per item
+        processed = []
+        for wav in waveforms:
+             # The probability is handled within _apply_gain
+             processed.append(_apply_gain(wav, self.prob, self.gain_db_low, self.gain_db_high))
+        return torch.stack(processed).to(waveforms.device) # Ensure device consistency
 
 class NoiseSampler(torch.nn.Module):
     """Applies noise by sampling directly from an HF dataset object."""
@@ -528,7 +573,9 @@ class WhisperFineTuneBrain(sb.Brain):
                         snr_high=self.hparams.noise_snr_high,
                         target_sample_rate=target_sr
                     )
+                    logging.info(f"Before appending NoiseSampler, sb_augmentations has {len(sb_augmentations)} items")
                     sb_augmentations.append(noise_sampler)
+                    logging.info(f"After appending NoiseSampler, sb_augmentations: {[type(a).__name__ for a in sb_augmentations]}")
                     initialized_augmentations.append("NoiseSampler")
                 except Exception as e:
                     logging.warning(f"Could not initialize NoiseSampler: {e}. Skipping.", exc_info=True)
@@ -543,7 +590,9 @@ class WhisperFineTuneBrain(sb.Brain):
                         rir_scale_factor=1.0,
                         target_sample_rate=target_sr
                     )
+                    logging.info(f"Before appending RIRSampler, sb_augmentations has {len(sb_augmentations)} items")
                     sb_augmentations.append(reverb_sampler)
+                    logging.info(f"After appending RIRSampler, sb_augmentations: {[type(a).__name__ for a in sb_augmentations]}")
                     initialized_augmentations.append("RIRSampler")
                 except Exception as e:
                     logging.warning(f"Could not initialize RIRSampler: {e}. Skipping.", exc_info=True)
@@ -563,6 +612,63 @@ class WhisperFineTuneBrain(sb.Brain):
                     initialized_augmentations.append("SpeedPerturb")
                 except Exception as e:
                     logging.warning(f"Could not initialize SpeedPerturb: {e}. Skipping.", exc_info=True)
+
+            # --- Initialize DropChunk --- 
+            drop_chunk_prob = getattr(self.hparams, "drop_chunk_prob", 0.0)
+            if drop_chunk_prob > 0:
+                try:
+                    drop_chunk = DropChunk(
+                        drop_length_low=self.hparams.drop_chunk_length_low,
+                        drop_length_high=self.hparams.drop_chunk_length_high,
+                        drop_count_low=self.hparams.drop_chunk_count_low,
+                        drop_count_high=self.hparams.drop_chunk_count_high,
+                    )
+                    sb_augmentations.append(drop_chunk)
+                    initialized_augmentations.append("DropChunk")
+                except Exception as e:
+                    logging.warning(f"Could not initialize DropChunk: {e}. Skipping.", exc_info=True)
+
+            # --- Initialize DropFreq --- 
+            drop_freq_prob = getattr(self.hparams, "drop_freq_prob", 0.0)
+            if drop_freq_prob > 0:
+                try:
+                    drop_freq = DropFreq(
+                        drop_freq_count_low=self.hparams.drop_freq_count_low,
+                        drop_freq_count_high=self.hparams.drop_freq_count_high,
+                    )
+                    sb_augmentations.append(drop_freq)
+                    initialized_augmentations.append("DropFreq")
+                except Exception as e:
+                    logging.warning(f"Could not initialize DropFreq: {e}. Skipping.", exc_info=True)
+
+            # --- Initialize PitchShiftWrapper --- 
+            pitch_prob = getattr(self.hparams, "pitch_prob", 0.0)
+            if pitch_prob > 0:
+                try:
+                    pitch_shifter = PitchShiftWrapper(
+                        prob=pitch_prob, # Pass prob for internal check
+                        pitch_steps_low=self.hparams.pitch_steps_low,
+                        pitch_steps_high=self.hparams.pitch_steps_high,
+                        sample_rate=target_sr,
+                    )
+                    sb_augmentations.append(pitch_shifter)
+                    initialized_augmentations.append("PitchShiftWrapper")
+                except Exception as e:
+                    logging.warning(f"Could not initialize PitchShiftWrapper: {e}. Skipping.", exc_info=True)
+
+            # --- Initialize GainWrapper --- 
+            gain_prob = getattr(self.hparams, "gain_prob", 0.0)
+            if gain_prob > 0:
+                try:
+                    gain_adjuster = GainWrapper(
+                        prob=gain_prob, # Pass prob for internal check
+                        gain_db_low=self.hparams.gain_db_low,
+                        gain_db_high=self.hparams.gain_db_high,
+                    )
+                    sb_augmentations.append(gain_adjuster)
+                    initialized_augmentations.append("GainWrapper")
+                except Exception as e:
+                    logging.warning(f"Could not initialize GainWrapper: {e}. Skipping.", exc_info=True)
 
             # --- Initialize Augmenter (WITHOUT probs argument) ---
             if sb_augmentations:
