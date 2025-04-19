@@ -182,24 +182,24 @@ hparams = {
 
     # Augmentation Params
     "augment": True,
-    "noise_prob": 0.25,
-    "reverb_prob": 0.10,
-    "speed_prob": 0.25,
-    "pitch_prob": 0.10,
-    "gain_prob": 0.25,
+    "noise_prob": 0.50,  # Increased
+    "reverb_prob": 0.30, # Increased
+    "speed_prob": 0.50,  # Increased
+    "pitch_prob": 0.30,  # Increased (Manual)
+    "gain_prob": 0.50,   # Increased (Manual)
     "min_augmentations": 1,
-    "max_augmentations": 1,
-    "noise_snr_low": 15,
+    "max_augmentations": 3,  # Increased - Allow combinations
+    "noise_snr_low": 15,    # Keep severity mild for now
     "noise_snr_high": 25,
-    "speed_factors": [95, 105],
-    "pitch_steps_low": -1,
+    "speed_factors": [95, 105], # Keep severity mild for now
+    "pitch_steps_low": -1,  # Keep severity mild for now
     "pitch_steps_high": 1,
-    "gain_db_low": -4,
+    "gain_db_low": -4,     # Keep severity mild for now
     "gain_db_high": 4,
 
     # Training Params
     "seed": 1986,
-    "epochs": 10,
+    "epochs": 5,
     "learning_rate": 5e-7,
     "lr_warmup_steps": 1000,
     "weight_decay": 0.05,
@@ -630,42 +630,7 @@ class WhisperFineTuneBrain(sb.Brain):
                     wavs = signals # Revert to original if augmentation fails
                     wav_lens = signal_lens
 
-            # ***** Temporarily disable manual per-sample augmentations *****
-            # if stage == sb.Stage.TRAIN and getattr(self.hparams, "augment", False):
-            #     proc_signals = []
-            #     original_lengths = []
-            #     for i in range(signals.shape[0]):
-            #          current_sig = signals[i]
-            #          current_id = ids[i]
-            #          current_len_abs = int(signal_lens[i].item() * current_sig.shape[0]) if signal_lens[i].item() > 0 and current_sig.dim() > 0 and current_sig.shape[0] > 0 else 0
-            #          if current_len_abs <= 0:
-            #               logging.warning(f"Skipping augmentation for zero-length signal in batch id {current_id}")
-            #               proc_signals.append(torch.tensor([], device=self.device))
-            #               original_lengths.append(0)
-            #               continue
-            #          unpadded_sig = current_sig[:current_len_abs]
-            #          final_sig = unpadded_sig.to(self.device)
-            #          try:
-            #               # Manual Augmentations (on device) - Use getattr
-            #               if getattr(self.hparams, "gain_prob", 0) > 0:
-            #                   final_sig = _apply_gain(final_sig, self.hparams.gain_prob,
-            #                                            self.hparams.gain_db_low, self.hparams.gain_db_high)
-            #               if getattr(self.hparams, "pitch_prob", 0) > 0:
-            #                   final_sig = _apply_pitch_shift(final_sig, self.hparams.target_sample_rate,
-            #                                                  self.hparams.pitch_prob, self.hparams.pitch_steps_low,
-            #                                                  self.hparams.pitch_steps_high)
-            #          except Exception as aug_e:
-            #               logging.warning(f"Augmentation failed for {current_id}: {aug_e}. Using partially/un-augmented signal.")
-            #          if final_sig.numel() > 0 and torch.all(torch.isfinite(final_sig)):
-            #              proc_signals.append(final_sig)
-            #              original_lengths.append(final_sig.shape[0])
-            #          else:
-            #              logging.warning(f"Signal empty or NaN/Inf after augmentation for {current_id}. Appending empty tensor.")
-            #              proc_signals.append(torch.tensor([], device=self.device))
-            #              original_lengths.append(0)
 
-            # --- Tokenize Text (using the potentially augmented wav_lens if needed, but likely not) ---
-            # This part uses the original 'texts'
             try:
                 tokens_list = [self.tokenizer.encode(t) for t in texts]
                 if any(not t for t in texts): logging.warning(f"Empty text found in batch: {texts}.")
@@ -941,9 +906,19 @@ class WhisperFineTuneBrain(sb.Brain):
                                 wandb_metrics = {}
                             
                             if wandb_metrics: # Only log if we have metrics
-                                wandb_metrics_clean = {k: v for k, v in wandb_metrics.items() if math.isfinite(v)}
-                                wandb.log(wandb_metrics_clean)
-                                logging.info(f"Logged {stage_key_prefix} epoch metrics to WandB.")
+                                # Convert torch tensors to float for W&B compatibility
+                                wandb_metrics_processed = {}
+                                for k, v in wandb_metrics.items():
+                                    if isinstance(v, torch.Tensor):
+                                        try:
+                                            v = v.item()
+                                        except Exception:
+                                            continue  # Skip if can't convert
+                                    wandb_metrics_processed[k] = v
+                                wandb_metrics_clean = {k: v for k, v in wandb_metrics_processed.items() if isinstance(v, (int, float)) and math.isfinite(v)}
+                                if wandb_metrics_clean:
+                                    wandb.log(wandb_metrics_clean)
+                                    logging.info(f"Logged {stage_key_prefix} epoch metrics to WandB.")
                         else:
                             logging.warning("WandB run not active, skipping epoch log.")
                     except ImportError:
@@ -1086,16 +1061,17 @@ class WhisperFineTuneBrain(sb.Brain):
                             "trainer/global_step": self.step,
                             "trainer/should_step": int(should_step),
                         }
-                        if max_norm_name:
-                            wandb_step_metrics["train/max_grad_param"] = max_norm_name
+                        # REMOVE logging the parameter name string
+                        # if max_norm_name:
+                        #     wandb_step_metrics["train/max_grad_param"] = max_norm_name
                         
-                        # Only log finite values
-                        wandb.log({k: v for k, v in wandb_step_metrics.items() if math.isfinite(v) if not isinstance(v, str)})
+                        # Only log finite numerical values
+                        wandb.log({k: v for k, v in wandb_step_metrics.items() if isinstance(v, (int, float)) and math.isfinite(v)})
                         
-                        # Log string values separately
-                        str_metrics = {k: v for k, v in wandb_step_metrics.items() if isinstance(v, str)}
-                        if str_metrics:
-                            wandb.log(str_metrics)
+                        # REMOVE separate string logging
+                        # str_metrics = {k: v for k, v in wandb_step_metrics.items() if isinstance(v, str)}
+                        # if str_metrics:
+                        #     wandb.log(str_metrics)
                             
                 except Exception as wandb_log_e:
                     logging.warning(f"Could not log step metrics to W&B: {wandb_log_e}")
@@ -1230,30 +1206,51 @@ def train_whisper_on_modal():
     wandb_run = None # Initialize wandb_run variable
 
     # === Robust W&B Initialization (Manual Approach) ===
-    if getattr(hparams, "use_wandb", False):
+    if hparams.get("use_wandb", False):
+        logging.info("Attempting W&B Initialization...")
         try:
             import wandb
             from datetime import datetime
-            if not os.environ.get("WANDB_API_KEY"):
-                 logging.warning("WANDB_API_KEY environment variable not found. W&B might fail.")
+            
+            # Log check for API key environment variable
+            wandb_api_key = os.environ.get("WANDB_API_KEY")
+            if wandb_api_key:
+                logging.info("WANDB_API_KEY environment variable found.")
+                # Optionally log first few/last few chars for verification, but be careful!
+                # logging.info(f"WANDB_API_KEY starts with: {wandb_api_key[:4]}") 
+            else:
+                 logging.warning("WANDB_API_KEY environment variable NOT found. W&B initialization might fail.")
 
+            # Use standard string formatting to avoid f-string quote issues
+            project_name = getattr(hparams, "wandb_project", "speechbrain-default")
+            entity_name = hparams.get("wandb_entity", None) # Use .get()
+            logging.info("Calling wandb.init with project='{}', entity='{}'".format(project_name, entity_name))
+            
             wandb_run = wandb.init(
-                project=getattr(hparams, "wandb_project", "speechbrain-default"),
-                entity=getattr(hparams, "wandb_entity", None),
+                project=project_name, # Use variable
+                entity=entity_name, # Use variable
                 config=hparams,
                 name=f"whisper-egy-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
                 job_type="train",
                 resume=False, # Explicitly set resume behavior if needed
             )
-            logging.info(f"WandB run initialized: {wandb_run.name} ({wandb_run.id}) - View at {wandb_run.url}")
+            # Log success or failure
+            if wandb_run:
+                 logging.info(f"WandB run initialized successfully: {wandb_run.name} ({wandb_run.id}) - View at {wandb_run.url}")
+            else:
+                 logging.error("wandb.init call completed but returned None. Initialization failed.")
+                 hparams["use_wandb"] = False # Ensure W&B is marked as disabled
+
         except ImportError:
-            logging.warning("wandb library not found. Skipping WandB.")
+            logging.error("wandb library not found. Skipping WandB.", exc_info=True) # Add exc_info
             hparams["use_wandb"] = False
             wandb_run = None
         except Exception as e:
-            logging.error(f"Could not initialize WandB: {e}", exc_info=True)
+            logging.error(f"Could not initialize WandB due to an exception: {e}", exc_info=True)
             hparams["use_wandb"] = False
             wandb_run = None
+    else:
+        logging.info("Skipping W&B Initialization because hparams['use_wandb'] is False.")
 
     try: # Main training try block
         logging.info("=== Starting train_whisper_on_modal function ===")
@@ -1506,11 +1503,12 @@ def train_whisper_on_modal():
 
         # --- WandB Watch Model (If enabled and wandb initialized) ---
         # Check if wandb_run exists (meaning wandb.init was successful)
-        if wandb_run and getattr(hparams, "wandb_watch_model", False):
+        if wandb_run and hparams.get("wandb_watch_model", False):
              try:
                  # Ensure wandb is available
                  import wandb 
-                 watch_freq = getattr(hparams, "wandb_watch_freq", 100)
+                 # Use .get() for watch frequency too
+                 watch_freq = hparams.get("wandb_watch_freq", 100)
                  # Watch the specific model module within the Brain class
                  wandb.watch(whisper_brain.modules.whisper, log="gradients", log_freq=watch_freq)
                  logging.info(f"WandB watching model gradients every {watch_freq} steps.")
@@ -1522,7 +1520,8 @@ def train_whisper_on_modal():
              # Log why watch wasn't enabled
              missing_watch_reasons = []
              if not wandb_run: missing_watch_reasons.append("W&B run not initialized")
-             if not getattr(hparams, "wandb_watch_model", False): missing_watch_reasons.append("W&B watch disabled in hparams")
+             # Use .get() for the check here too
+             if not hparams.get("wandb_watch_model", False): missing_watch_reasons.append("W&B watch disabled in hparams")
              # No need to check brain or logger type here if W&B isn't active
              if missing_watch_reasons: logging.info(f"Skipping wandb.watch because: {', '.join(missing_watch_reasons)}")
 
