@@ -212,14 +212,14 @@ hparams = {
     # Training Params
     "seed": 1986,
     "epochs": 5,
-    "learning_rate": 5e-7,
+    "learning_rate": 1e-6,
     "lr_warmup_steps": 1000,
     "weight_decay": 0.05,
     "lr_annealing_factor": 0.9,
     "batch_size_dynamic": False,
     "loader_batch_size": 8,
-    "max_batch_len_seconds": 5.0,
-    "num_workers": 4,
+    "max_batch_len_seconds": 20.0,
+    "num_workers": 8,
     "grad_accumulation_factor": 2,
     "max_grad_norm": 5.0,
 
@@ -237,6 +237,7 @@ hparams = {
     "wandb_log_batch_freq": 100,  # Log batch metrics every N steps
     "wandb_watch_model": True,  # Whether to watch gradients
     "wandb_watch_freq": 100,  # How often to log gradients
+    "wandb_resume_id": "gzvptbw3", # <<< ADD THIS LINE: Set to a run ID string to resume that run
 }
 
 # Add a check after hparams definition
@@ -349,14 +350,31 @@ class PitchShiftWrapper(torch.nn.Module):
         self.sample_rate = sample_rate
 
     def forward(self, waveforms, lengths=None): # Match Augmenter signature
-        # Note: _apply_pitch_shift expects a single waveform, apply per item
-        processed = []
-        for wav in waveforms:
-             # The probability is handled within _apply_pitch_shift
-             processed.append(_apply_pitch_shift(wav, self.sample_rate, self.prob, self.pitch_steps_low, self.pitch_steps_high))
-        return torch.stack(processed).to(waveforms.device) # Ensure device consistency
+        if random.random() < self.prob:
+            n_steps = random.randint(self.pitch_steps_low, self.pitch_steps_high)
+            if n_steps != 0:
+                try:
+                    # Apply pitch shift to the entire batch
+                    # Ensure waveform tensor is on CPU if required by torchaudio
+                    result = torchaudio.functional.pitch_shift(
+                        waveforms.cpu(), self.sample_rate, n_steps=n_steps
+                    ).to(waveforms.device)
 
-# --- Wrapper for Manual Gain --- 
+                    if not torch.all(torch.isfinite(result)):
+                        logging.warning("NaN/Inf detected after pitch shift. Using original waveforms.")
+                        return waveforms
+                    return result
+                except Exception as e:
+                    logging.warning(f"Batch torchaudio pitch shift failed: {e}. Using original waveforms.")
+                    return waveforms
+            else:
+                # No shift applied if n_steps is 0
+                return waveforms
+        else:
+            # Probability check failed, return original waveforms
+            return waveforms
+
+# --- Wrapper for Manual Gain ---
 class GainWrapper(torch.nn.Module):
     def __init__(self, prob, gain_db_low, gain_db_high):
         super().__init__()
@@ -365,12 +383,33 @@ class GainWrapper(torch.nn.Module):
         self.gain_db_high = gain_db_high
 
     def forward(self, waveforms, lengths=None): # Match Augmenter signature
-        # Note: _apply_gain expects a single waveform, apply per item
-        processed = []
-        for wav in waveforms:
-             # The probability is handled within _apply_gain
-             processed.append(_apply_gain(wav, self.prob, self.gain_db_low, self.gain_db_high))
-        return torch.stack(processed).to(waveforms.device) # Ensure device consistency
+        if random.random() < self.prob:
+            batch_size = waveforms.shape[0]
+            # Generate a batch of random gain values in dB
+            gain_db = torch.rand(batch_size, device=waveforms.device) * (self.gain_db_high - self.gain_db_low) + self.gain_db_low
+            
+            # Convert dB to amplitude factors
+            # Avoid potential issues with very low dB values causing large negative exponents
+            gain_amp = 10.0 ** (torch.clamp(gain_db, min=-80.0) / 20.0) # Clamp dB before exponentiation
+
+            # Reshape gain_amp for broadcasting
+            # Add dimensions to match waveform tensor (e.g., [batch, 1] or [batch, 1, 1])
+            for _ in range(waveforms.dim() - 1):
+                gain_amp = gain_amp.unsqueeze(-1)
+
+            # Apply gain using vectorized multiplication
+            result = waveforms * gain_amp
+
+            # Apply clamp operation vectorized
+            result = torch.clamp(result, min=-1.0, max=1.0)
+
+            if not torch.all(torch.isfinite(result)):
+                logging.warning("NaN/Inf detected after batched gain adjustment. Using original waveforms.")
+                return waveforms
+            return result
+        else:
+            # Probability check failed, return original waveforms
+            return waveforms
 
 class NoiseSampler(torch.nn.Module):
     """Applies noise by sampling directly from an HF dataset object."""
@@ -696,7 +735,7 @@ class WhisperFineTuneBrain(sb.Brain):
 
     def __del__(self):
         """Clean up temporary files when the object is destroyed."""
-        try:
+        try:            
             if hasattr(self, '_temp_dir') and os.path.exists(self._temp_dir):
                 shutil.rmtree(self._temp_dir)
                 logging.info(f"Cleaned up temporary directory: {self._temp_dir}")
@@ -1330,16 +1369,33 @@ def train_whisper_on_modal():
             # Use standard string formatting to avoid f-string quote issues
             project_name = getattr(hparams, "wandb_project", "speechbrain-default")
             entity_name = hparams.get("wandb_entity", None) # Use .get()
-            logging.info("Calling wandb.init with project='{}', entity='{}'".format(project_name, entity_name))
+            resume_id = hparams.get("wandb_resume_id", None) # Get the resume ID
+
+            # === Conditional W&B Init ===
+            if resume_id:
+                logging.info(f"Attempting to resume W&B run with ID: {resume_id}")
+                wandb_run = wandb.init(
+                    project=project_name,
+                    entity=entity_name,
+                    id=resume_id,          # Pass the specific ID
+                    resume="must",       # Ensure it resumes or fails
+                    config=hparams,        # Still log config for reference
+                    job_type="train",
+                    # Note: name is omitted, W&B uses the existing run's name
+                )
+            else:
+                logging.info("Starting a new W&B run.")
+                logging.info("Calling wandb.init with project='{}', entity='{}'".format(project_name, entity_name))
+                wandb_run = wandb.init(
+                    project=project_name, # Use variable
+                    entity=entity_name, # Use variable
+                    config=hparams,
+                    name=f"whisper-egy-{datetime.now().strftime('%Y%m%d-%H%M%S')}", # Generate name for new runs
+                    job_type="train",
+                    resume=False, # Explicitly false for new runs
+                )
+            # === End Conditional W&B Init ===
             
-            wandb_run = wandb.init(
-                project=project_name, # Use variable
-                entity=entity_name, # Use variable
-                config=hparams,
-                name=f"whisper-egy-{datetime.now().strftime('%Y%m%d-%H%M%S')}",
-                job_type="train",
-                resume=False, # Explicitly set resume behavior if needed
-            )
             # Log success or failure
             if wandb_run:
                  logging.info(f"WandB run initialized successfully: {wandb_run.name} ({wandb_run.id}) - View at {wandb_run.url}")
