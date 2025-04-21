@@ -104,7 +104,8 @@ modal_image = (
     modal.Image.debian_slim(python_version="3.10")
     .apt_install(
         "build-essential", "cmake", "libboost-all-dev",
-        "libeigen3-dev", "git", "libsndfile1", "ffmpeg"
+        "libeigen3-dev", "git", "libsndfile1", "ffmpeg",
+        "wget" # Add wget for downloading noise files
     )
     .pip_install(
         "pip==23.3.2",
@@ -130,6 +131,13 @@ modal_image = (
         "pyyaml==6.0.1",
         "tqdm==4.66.1",
         "pandas==2.1.4",
+        "soundfile==0.12.1" # Add soundfile explicitly
+    )
+    # Download noise assets during image build
+    .run_commands(
+        "mkdir /noise_assets",
+        "wget https://www.dropbox.com/s/aleer424jumcs08/noise2.wav -O /noise_assets/noise2.wav",
+        "wget https://www.dropbox.com/s/eoxxi2ezr8owk8a/noise3.wav -O /noise_assets/noise3.wav"
     )
 )
 
@@ -163,7 +171,6 @@ hparams = {
     "train_split": "train",
     "valid_split": "validation",
     "test_split": "test",
-    "noise_dataset_id": "Myrtle/CAIMAN-ASR-BackgroundNoise",
     "rir_dataset_id": "Fhrozen/tau_srir_db",
     "target_sample_rate": TARGET_SAMPLE_RATE,
 
@@ -182,43 +189,65 @@ hparams = {
 
     # Augmentation Params
     "augment": True,
-    "noise_prob": 0.50,  # Increased
-    "reverb_prob": 0.30, # Increased
-    "speed_prob": 0.50,  # Increased
-    "pitch_prob": 0.30,  # Increased (Manual)
-    "gain_prob": 0.50,   # Increased (Manual)
+    "noise_prob": 0.30,  # Probability for AddNoise
+    "reverb_prob": 0.30, # Probability for AddReverb (via RIRSampler)
+    "speed_prob": 0.50,  # Probability for SpeedPerturb
+    "pitch_prob": 0.30,  # Probability for PitchShiftWrapper
+    "gain_prob": 0.50,   # Probability for GainWrapper
+    "drop_chunk_prob": 0.30, # Probability for DropChunk
+    "drop_freq_prob": 0.30,  # Probability for DropFreq
+    "clip_prob": 0.30,       # Probability for DoClip
+    "drop_bit_prob": 0.30,   # Probability for DropBitResolution
+
     "min_augmentations": 1,
-    "max_augmentations": 1,  # Apply 1 to 3 from the pool
-    "noise_snr_low": 15,    # Keep severity mild for now
+    "max_augmentations": 1,  # Apply 1 to 3 from the eligible pool (updated later)
+
+    # AddNoise Params (NEW/UPDATED)
+    "noise_snr_low": 15,
     "noise_snr_high": 25,
-    "speed_factors": [95, 105], # Keep severity mild for now
-    "pitch_steps_low": -1,  # Keep severity mild for now
+
+    # RIRSampler Params
+    "rir_scale_factor": 1.0, # For RIRSampler
+
+    # SpeedPerturb Params
+    "speed_factors": [95, 105],
+
+    # PitchShiftWrapper Params
+    "pitch_steps_low": -1,
     "pitch_steps_high": 1,
-    "gain_db_low": -4,     # Keep severity mild for now
+
+    # GainWrapper Params
+    "gain_db_low": -4,
     "gain_db_high": 4,
 
     # DropChunk Params
-    "drop_chunk_prob": 0.30,
-    "drop_chunk_length_low": 1600,  # ~100ms
-    "drop_chunk_length_high": 4800, # ~300ms
+    "drop_chunk_length_low": 1600,
+    "drop_chunk_length_high": 4800,
     "drop_chunk_count_low": 1,
     "drop_chunk_count_high": 5,
 
     # DropFreq Params
-    "drop_freq_prob": 0.30,
     "drop_freq_count_low": 1,
     "drop_freq_count_high": 3,
 
+    # DoClip Params
+    "clip_low": 0.7,
+    "clip_high": 0.9,
+
+    # DropBitResolution Params (REVISED)
+    # No low/high needed, target_dtype='random' is default in class
+
     # Training Params
     "seed": 1986,
-    "epochs": 5,
+    "epochs": 11,
     "learning_rate": 1e-6,
     "lr_warmup_steps": 1000,
     "weight_decay": 0.05,
     "lr_annealing_factor": 0.9,
-    "batch_size_dynamic": False,
-    "loader_batch_size": 8,
-    "max_batch_len_seconds": 20.0,
+    "batch_size_dynamic": False, # <--- DISABLED DYNAMIC BATCHING
+    "dynamic_batch_num_buckets": 60, # (Not used when dynamic batching is False)
+    "loader_batch_size": 8, # Used only if batch_size_dynamic is False
+    "max_batch_len_seconds": 40.0,
     "num_workers": 8,
     "grad_accumulation_factor": 2,
     "max_grad_norm": 5.0,
@@ -237,7 +266,7 @@ hparams = {
     "wandb_log_batch_freq": 100,  # Log batch metrics every N steps
     "wandb_watch_model": True,  # Whether to watch gradients
     "wandb_watch_freq": 100,  # How often to log gradients
-    "wandb_resume_id": "gzvptbw3", # <<< ADD THIS LINE: Set to a run ID string to resume that run
+    "wandb_resume_id": None, # <<< ADD THIS LINE: Set to a run ID string to resume that run
 }
 
 # Add a check after hparams definition
@@ -330,13 +359,21 @@ print("Data Loading Pipelines defined.")
 import speechbrain as sb
 from speechbrain.utils.metric_stats import ErrorRateStats
 from speechbrain.dataio.batch import PaddedBatch
-from speechbrain.augment.time_domain import SpeedPerturb, AddNoise, AddReverb, DropChunk, DropFreq
+# Consolidated imports
+from speechbrain.augment.time_domain import (
+    SpeedPerturb, AddNoise, AddReverb, DropChunk, DropFreq,
+    DoClip, DropBitResolution
+)
 from speechbrain.augment.augmenter import Augmenter
 import os
 import string
 import torch
 import torch.nn.utils.rnn as rnn_utils
 import math
+import uuid # Needed for noise file naming
+import soundfile as sf # Needed for writing noise files
+import csv # Needed for writing noise manifest
+import torchaudio # Needed for resampling noise
 
 # --- Wrapper Augmentation Modules (placed before Brain class for visibility) ---
 
@@ -410,72 +447,6 @@ class GainWrapper(torch.nn.Module):
         else:
             # Probability check failed, return original waveforms
             return waveforms
-
-class NoiseSampler(torch.nn.Module):
-    """Applies noise by sampling directly from an HF dataset object."""
-    def __init__(self, noise_dataset, snr_low=0, snr_high=0, target_sample_rate=16000, normalize=False):
-        super().__init__()
-        self.noise_dataset = noise_dataset
-        self.num_noises = len(noise_dataset) if noise_dataset is not None else 0
-        self.snr_low = snr_low
-        self.snr_high = snr_high
-        self.target_sample_rate = target_sample_rate
-        self.normalize = normalize
-
-    def forward(self, waveforms, lengths):
-        if self.num_noises == 0:
-            return waveforms
-
-        batch_size, max_len = waveforms.shape[0], waveforms.shape[1]
-        abs_lengths = (lengths * max_len).long().squeeze(1) if lengths.dim() == 2 else (lengths * max_len).long()
-
-        clean_amp = compute_amplitude(waveforms, abs_lengths.unsqueeze(1), amp_type="rms")
-        SNR = torch.rand(batch_size, 1, device=waveforms.device) * (self.snr_high - self.snr_low) + self.snr_low
-        noise_factor = 1 / (dB_to_amplitude(SNR) + 1)
-        if waveforms.dim() == 3:
-            noise_factor = noise_factor.unsqueeze(1)
-
-        new_noise_amp = noise_factor * clean_amp
-        noisy_waveform = waveforms * (1 - noise_factor)
-
-        processed = []
-        for i in range(batch_size):
-            try:
-                idx = random.randint(0, self.num_noises - 1)
-                item = self.noise_dataset[idx]["audio"]
-                noise_wav = torch.tensor(item["array"], device=waveforms.device).float()
-                sr = item["sampling_rate"]
-                if sr != self.target_sample_rate:
-                    noise_wav = torchaudio.functional.resample(noise_wav, sr, self.target_sample_rate)
-
-                tgt_len = abs_lengths[i].item()
-                cur_len = noise_wav.shape[-1]
-                if cur_len > tgt_len:
-                    start = random.randint(0, cur_len - tgt_len)
-                    noise_wav = noise_wav[..., start:start+tgt_len]
-                elif cur_len < tgt_len:
-                    noise_wav = torch.nn.functional.pad(noise_wav, (0, tgt_len - cur_len))
-
-                orig_amp = compute_amplitude(noise_wav.unsqueeze(0), torch.tensor([noise_wav.numel()], device=waveforms.device), amp_type="rms")
-                noise_wav = noise_wav * new_noise_amp[i] / (orig_amp + 1e-14)
-
-                if noise_wav.shape[-1] < max_len:
-                    noise_wav = torch.nn.functional.pad(noise_wav, (0, max_len - noise_wav.shape[-1]))
-
-                processed.append(noise_wav)
-            except Exception as e:
-                logging.warning(f"NoiseSampler error on sample {i}: {e}")
-                processed.append(torch.zeros(max_len, device=waveforms.device))
-
-        noise_batch = torch.stack(processed, dim=0)
-        noisy_waveform = noisy_waveform + noise_batch
-
-        if self.normalize:
-            abs_max, _ = torch.max(torch.abs(noisy_waveform), dim=1, keepdim=True)
-            noisy_waveform = noisy_waveform / abs_max.clamp(min=1.0)
-
-        return noisy_waveform
-
 
 class RIRSampler(torch.nn.Module):
     """Applies reverberation by sampling RIRs directly from an HF dataset object."""
@@ -564,10 +535,8 @@ class WhisperFineTuneBrain(sb.Brain):
         self.augmenter = None
         initialized_augmentations = []
 
-        # Create temporary directory for CSV files
+        # Create temporary directory for augmentation manifests (CSV files)
         temp_dir = tempfile.mkdtemp()
-        noise_csv_path = os.path.join(temp_dir, "noise_augment.csv")
-        rir_csv_path = os.path.join(temp_dir, "rir_augment.csv")
         self._temp_dir = temp_dir  # Store for cleanup
 
         # ***** Use getattr for hparams access *****
@@ -576,20 +545,10 @@ class WhisperFineTuneBrain(sb.Brain):
 
             target_sr = getattr(self.hparams, "target_sample_rate", TARGET_SAMPLE_RATE)
 
-            # --- Load Noise/RIR Dataset Objects ---
-            hparams["noise_dataset_object"] = None
+            # --- Load RIR Dataset Object ---
             hparams["rir_dataset_object"] = None
             if hparams.get("augment", False):
                 try:
-                     noise_ds_id = hparams.get("noise_dataset_id")
-                     if noise_ds_id:
-                          logging.info(f"Loading noise dataset object: {noise_ds_id}")
-                          try:
-                               noise_ds = load_dataset(noise_ds_id, cache_dir=CACHE_DIR, split="train")
-                               hparams["noise_dataset_object"] = noise_ds
-                               logging.info(f"Loaded noise dataset object with {len(noise_ds)} samples.")
-                          except Exception as e_noise_load: logging.warning(f"Could not load noise dataset object {noise_ds_id}: {e_noise_load}")
-
                      rir_ds_id = hparams.get("rir_dataset_id")
                      if rir_ds_id:
                           logging.info(f"Loading RIR dataset object: {rir_ds_id}")
@@ -597,29 +556,75 @@ class WhisperFineTuneBrain(sb.Brain):
                                rir_ds = load_dataset(rir_ds_id, cache_dir=CACHE_DIR, split="train")
                                hparams["rir_dataset_object"] = rir_ds
                                logging.info(f"Loaded RIR dataset object with {len(rir_ds)} samples.")
-                          except Exception as e_rir_load: logging.warning(f"Could not load RIR dataset object {rir_ds_id}: {e_rir_load}")
-                except Exception as e: logging.warning(f"General error loading noise/RIR dataset objects: {e}.")
-            else: logging.info("Skipping noise/RIR dataset loading as augmentation is disabled.")
+                          except Exception as e_rir_load: logging.warning(f"Could not load RIR dataset object {rir_ds_id}: {e_rir_load}", exc_info=True) # Added exc_info
+                except Exception as e: logging.warning(f"General error loading RIR dataset objects: {e}.", exc_info=True) # Added exc_info
+            else: logging.info("Skipping RIR dataset loading as augmentation is disabled.")
 
-            # --- Initialize NoiseSampler using dataset object ---
-            noise_dataset = getattr(self.hparams, "noise_dataset_object", None)
+            # --- Dynamically Create Noise CSV and Initialize AddNoise (REVISED) ---
             noise_prob = getattr(self.hparams, "noise_prob", 0.0)
-            if noise_prob > 0 and noise_dataset is not None:
+            fixed_noise_wav_dir = "/noise_assets" # Directory containing the downloaded WAVs
+            noise_manifest_path = os.path.join(self._temp_dir, "noise_manifest.csv")
+
+            if noise_prob > 0:
+                logging.info(f"Dynamically creating noise manifest at: {noise_manifest_path}")
                 try:
-                    noise_sampler = NoiseSampler(
-                        noise_dataset=noise_dataset,
-                        snr_low=self.hparams.noise_snr_low,
-                        snr_high=self.hparams.noise_snr_high,
-                        target_sample_rate=target_sr
-                    )
-                    logging.info(f"Before appending NoiseSampler, sb_augmentations has {len(sb_augmentations)} items")
-                    sb_augmentations.append(noise_sampler)
-                    logging.info(f"After appending NoiseSampler, sb_augmentations: {[type(a).__name__ for a in sb_augmentations]}")
-                    initialized_augmentations.append("NoiseSampler")
-                except Exception as e:
-                    logging.warning(f"Could not initialize NoiseSampler: {e}. Skipping.", exc_info=True)
+                    # List WAV files in the noise assets directory
+                    noise_files = [f for f in os.listdir(fixed_noise_wav_dir) if f.endswith('.wav')]
+                    if not noise_files:
+                        logging.warning(f"No WAV files found in {fixed_noise_wav_dir} for noise augmentation. Skipping AddNoise.")
+                        # Invalidate manifest path if no noise files are found
+                        noise_manifest_path = None
+                    else:
+                        logging.info(f"Found noise files: {noise_files}")
+                        # Write the noise manifest CSV
+                        with open(noise_manifest_path, 'w', newline='', encoding='utf-8') as outfile:
+                            writer = csv.writer(outfile)
+                            # === CHANGE 1: Simplified header ===
+                            header = ["ID", "duration", "wav", "wav_format", "wav_opts"]
+                            writer.writerow(header)
+
+                            # Add each noise file to the CSV
+                            for noise_file in noise_files:
+                                file_id = os.path.splitext(noise_file)[0] # Use filename as ID
+                                full_path = os.path.join(fixed_noise_wav_dir, noise_file)
+                                duration = 0.0
+                                try:
+                                    # Get audio info to determine duration
+                                    info = torchaudio.info(full_path)
+                                    duration = info.num_frames / info.sample_rate
+                                    if duration <= 0:
+                                        logging.warning(f"Calculated zero or negative duration for {noise_file}. Skipping.")
+                                        continue # Skip files with invalid duration
+                                except Exception as e_info:
+                                    logging.warning(f"Could not get info/duration for {noise_file}: {e_info}. Skipping.", exc_info=True)
+                                    continue # Skip files we can't get info for
+
+                                # === CHANGE 2: Write the full_path ===
+                                writer.writerow([file_id, f"{duration:.2f}", full_path, "wav", ""]) 
+                            logging.info(f"Noise manifest created at {noise_manifest_path}.")
+
+                        # Check if any rows were actually written (besides the header)
+                        if os.path.exists(noise_manifest_path) and os.path.getsize(noise_manifest_path) > len(",".join(header).encode('utf-8')):
+                            # === CHANGE 3: Remove replacements argument ===
+                            noise_adder = AddNoise(
+                                csv_file=noise_manifest_path, # Use the dynamically created manifest
+                                snr_low=getattr(self.hparams, "noise_snr_low", 0), # Use getattr with default
+                                snr_high=getattr(self.hparams, "noise_snr_high", 0), # Use getattr with default
+                            )
+                            sb_augmentations.append(noise_adder)
+                            initialized_augmentations.append("AddNoise")
+                            logging.info(f"Successfully initialized AddNoise with dynamically created manifest (using full paths).")
+                        else:
+                             logging.warning(f"Dynamically created noise manifest is empty or header-only. Skipping AddNoise initialization.")
+                             noise_manifest_path = None # Invalidate the path
+
+
+                except Exception as e_create_manifest:
+                    logging.warning(f"Could not create noise manifest or initialize AddNoise: {e_create_manifest}. Skipping AddNoise.", exc_info=True)
+                    noise_manifest_path = None # Ensure path is None on error
 
             # --- Initialize RIRSampler using dataset object ---
+            # (Keep RIRSampler as is, using direct HF dataset access for reverb)
             rir_dataset = getattr(self.hparams, "rir_dataset_object", None)
             reverb_prob = getattr(self.hparams, "reverb_prob", 0.0)
             if reverb_prob > 0 and rir_dataset is not None:
@@ -629,9 +634,7 @@ class WhisperFineTuneBrain(sb.Brain):
                         rir_scale_factor=1.0,
                         target_sample_rate=target_sr
                     )
-                    logging.info(f"Before appending RIRSampler, sb_augmentations has {len(sb_augmentations)} items")
                     sb_augmentations.append(reverb_sampler)
-                    logging.info(f"After appending RIRSampler, sb_augmentations: {[type(a).__name__ for a in sb_augmentations]}")
                     initialized_augmentations.append("RIRSampler")
                 except Exception as e:
                     logging.warning(f"Could not initialize RIRSampler: {e}. Skipping.", exc_info=True)
@@ -652,7 +655,7 @@ class WhisperFineTuneBrain(sb.Brain):
                 except Exception as e:
                     logging.warning(f"Could not initialize SpeedPerturb: {e}. Skipping.", exc_info=True)
 
-            # --- Initialize DropChunk --- 
+            # --- Initialize DropChunk ---
             drop_chunk_prob = getattr(self.hparams, "drop_chunk_prob", 0.0)
             if drop_chunk_prob > 0:
                 try:
@@ -667,7 +670,7 @@ class WhisperFineTuneBrain(sb.Brain):
                 except Exception as e:
                     logging.warning(f"Could not initialize DropChunk: {e}. Skipping.", exc_info=True)
 
-            # --- Initialize DropFreq --- 
+            # --- Initialize DropFreq ---
             drop_freq_prob = getattr(self.hparams, "drop_freq_prob", 0.0)
             if drop_freq_prob > 0:
                 try:
@@ -680,7 +683,7 @@ class WhisperFineTuneBrain(sb.Brain):
                 except Exception as e:
                     logging.warning(f"Could not initialize DropFreq: {e}. Skipping.", exc_info=True)
 
-            # --- Initialize PitchShiftWrapper --- 
+            # --- Initialize PitchShiftWrapper ---
             pitch_prob = getattr(self.hparams, "pitch_prob", 0.0)
             if pitch_prob > 0:
                 try:
@@ -695,7 +698,7 @@ class WhisperFineTuneBrain(sb.Brain):
                 except Exception as e:
                     logging.warning(f"Could not initialize PitchShiftWrapper: {e}. Skipping.", exc_info=True)
 
-            # --- Initialize GainWrapper --- 
+            # --- Initialize GainWrapper ---
             gain_prob = getattr(self.hparams, "gain_prob", 0.0)
             if gain_prob > 0:
                 try:
@@ -709,27 +712,55 @@ class WhisperFineTuneBrain(sb.Brain):
                 except Exception as e:
                     logging.warning(f"Could not initialize GainWrapper: {e}. Skipping.", exc_info=True)
 
-            # --- Initialize Augmenter (WITHOUT probs argument) ---
+            # --- Initialize DoClip (NEW) ---
+            clip_prob = getattr(self.hparams, "clip_prob", 0.0)
+            if clip_prob > 0:
+                try:
+                    clipper = DoClip(
+                        clip_low=self.hparams.clip_low,
+                        clip_high=self.hparams.clip_high,
+                        # prob=clip_prob # REMOVED: DoClip doesn't take prob directly
+                    )
+                    sb_augmentations.append(clipper)
+                    initialized_augmentations.append("DoClip")
+                except Exception as e:
+                    logging.warning(f"Could not initialize DoClip: {e}. Skipping.", exc_info=True)
+
+            # --- Initialize DropBitResolution (REVISED) ---
+            drop_bit_prob = getattr(self.hparams, "drop_bit_prob", 0.0)
+            if drop_bit_prob > 0:
+                try:
+                    # Initialize correctly with no args (uses default target_dtype='random')
+                    bit_dropper = DropBitResolution()
+                    sb_augmentations.append(bit_dropper)
+                    initialized_augmentations.append("DropBitResolution")
+                except Exception as e:
+                    logging.warning(f"Could not initialize DropBitResolution: {e}. Skipping.", exc_info=True)
+
+
+            # --- Initialize Augmenter ---
             if sb_augmentations:
                 try:
-                    # Initialize based on Augmenter source code (NO probs argument)
+                    effective_max_augmentations = min(
+                        getattr(self.hparams, "max_augmentations", len(sb_augmentations)),
+                        len(sb_augmentations)
+                    )
                     self.augmenter = Augmenter(
                         parallel_augment=False,
                         concat_original=False,
                         min_augmentations=getattr(self.hparams, "min_augmentations", 1),
-                        max_augmentations=getattr(self.hparams, "max_augmentations", len(sb_augmentations)),
+                        max_augmentations=effective_max_augmentations,
                         shuffle_augmentations=True,
                         augment_prob=1.0,
-                        augmentations=sb_augmentations, # Pass list of sampler/perturber objects
+                        augmentations=sb_augmentations,
                     )
                     aug_names = [type(aug).__name__ for aug in sb_augmentations]
-                    logging.info(f"SpeechBrain Augmenter initialized with: {', '.join(aug_names)}")
+                    logging.info(f"SpeechBrain Augmenter initialized with {len(aug_names)} potential augmentations: {', '.join(aug_names)}")
+                    logging.info(f"Applying min={getattr(self.hparams, 'min_augmentations', 1)}, max={effective_max_augmentations} from the pool per batch.")
                 except Exception as e:
                     logging.warning(f"Could not initialize main Augmenter: {e}. Not initialized.", exc_info=True)
                     self.augmenter = None
-                    initialized_augmentations = []
-            else:
-                logging.info("No SpeechBrain augmentations were added.")
+
         else:
             logging.info("Data augmentation disabled via hparams.")
 
@@ -839,15 +870,21 @@ class WhisperFineTuneBrain(sb.Brain):
     def compute_forward(self, batch, stage):
         """Runs preprocessing and the Whisper model forward pass."""
         try:
-            wavs, wav_lens, tokens_bos_data, _, _, _ = self._preprocess_batch(batch, stage)
-            tokens_bos, _ = tokens_bos_data
+            # Call preprocess ONCE and get all required outputs
+            wavs, wav_lens, tokens_bos_data, tokens_eos_data, tokens_data, texts = self._preprocess_batch(batch, stage)
+            tokens_bos, _ = tokens_bos_data # Unpack for model input
 
             if wavs is None or tokens_bos is None or wavs.numel() == 0 or tokens_bos.numel() == 0:
                  logging.error("Empty/None tensors from preprocessing in compute_forward.")
                  bsz = batch.batch_size if hasattr(batch, 'batch_size') else 1
                  dummy_log_probs = torch.zeros((bsz, 1, self.tokenizer.vocab_size), device=self.device)
                  dummy_wav_lens = torch.zeros(bsz, device=self.device)
-                 return dummy_log_probs, None, dummy_wav_lens
+                 # Return dummy data matching the NEW expected structure
+                 dummy_tokens = torch.full((bsz, 1), self.pad_token_id, dtype=torch.long, device=self.device)
+                 dummy_tok_lens = torch.zeros(bsz, device=self.device, dtype=torch.float)
+                 dummy_texts = ["preprocessing_error"] * bsz
+                 return (dummy_log_probs, None, dummy_wav_lens,
+                         (dummy_tokens, dummy_tok_lens), (dummy_tokens, dummy_tok_lens), dummy_texts)
 
             enc_out, logits, hyps = self.modules.whisper(wavs, tokens_bos)
 
@@ -869,21 +906,28 @@ class WhisperFineTuneBrain(sb.Brain):
                     logging.error(f"Error during greedy decoding: {dec_e}")
                     hyps_out = None
 
-            return log_probs, hyps_out, wav_lens.to(self.device)
+            # Return model outputs AND the target info from the single preprocess call
+            return log_probs, hyps_out, wav_lens.to(self.device), tokens_eos_data, tokens_data, texts
 
         except Exception as e:
              logging.error(f"Error in compute_forward: {e}", exc_info=True)
              bsz = batch.batch_size if hasattr(batch, 'batch_size') else 1
              dummy_log_probs = torch.zeros((bsz, 1, self.tokenizer.vocab_size), device=self.device)
              dummy_wav_lens = torch.zeros(bsz, device=self.device)
-             return dummy_log_probs, None, dummy_wav_lens
+             # Return dummy data matching the NEW expected structure
+             dummy_tokens = torch.full((bsz, 1), self.pad_token_id, dtype=torch.long, device=self.device)
+             dummy_tok_lens = torch.zeros(bsz, device=self.device, dtype=torch.float)
+             dummy_texts = ["preprocessing_error"] * bsz
+             return (dummy_log_probs, None, dummy_wav_lens,
+                     (dummy_tokens, dummy_tok_lens), (dummy_tokens, dummy_tok_lens), dummy_texts)
 
 
     # --- compute_objectives (Mostly unchanged, relies on preprocessing fix) ---
     def compute_objectives(self, predictions, batch, stage):
         """Computes the loss and evaluation metrics."""
         try:
-            log_probs, hyps, wav_lens = predictions
+            # Unpack predictions from compute_forward (now includes targets)
+            log_probs, hyps, wav_lens, tokens_eos_data, tokens_data, target_words_raw = predictions
 
             if log_probs is None or not torch.all(torch.isfinite(log_probs)):
                  logging.error("Invalid log_probs (None, NaN/Inf) in compute_objectives. Returning zero loss.")
@@ -891,19 +935,34 @@ class WhisperFineTuneBrain(sb.Brain):
 
             ids = getattr(batch, 'id', [f'no_id_{i}' for i in range(log_probs.shape[0])])
 
-            try:
-                 _, _, _, tokens_eos_data, tokens_data, target_words_raw = self._preprocess_batch(batch, stage)
-                 if tokens_eos_data is None or tokens_eos_data[0] is None:
-                      logging.error("Failed to retrieve targets from preprocessing.")
-                      return torch.tensor(0.0, device=self.device, requires_grad=False)
-                 tokens_eos_padded, tokens_eos_lens_rel = tokens_eos_data
-                 tokens_padded, tokens_lens_rel = tokens_data
-            except Exception as e:
-                 logging.error(f"Error retrieving targets in compute_objectives: {e}")
+            # --- Targets are now directly available from predictions --- 
+            # try:
+            #      _, _, _, tokens_eos_data, tokens_data, target_words_raw = self._preprocess_batch(batch, stage)
+            #      if tokens_eos_data is None or tokens_eos_data[0] is None:
+            #           logging.error("Failed to retrieve targets from preprocessing.")
+            #           return torch.tensor(0.0, device=self.device, requires_grad=False)
+            #      tokens_eos_padded, tokens_eos_lens_rel = tokens_eos_data
+            #      tokens_padded, tokens_lens_rel = tokens_data
+            # except Exception as e:
+            #      logging.error(f"Error retrieving targets in compute_objectives: {e}")
+            #      return torch.tensor(0.0, device=self.device, requires_grad=False)
+            
+            # Directly unpack target tokens from predictions
+            if tokens_eos_data is None or tokens_eos_data[0] is None:
+                 logging.error("Missing target token data (tokens_eos_data) in predictions.")
                  return torch.tensor(0.0, device=self.device, requires_grad=False)
+            tokens_eos_padded, tokens_eos_lens_rel = tokens_eos_data
+            # Unpack original tokens too, if needed for future metrics (not currently used in loss)
+            if tokens_data is None or tokens_data[0] is None:
+                 logging.warning("Missing original token data (tokens_data) in predictions.")
+                 # Set defaults if needed, though not used for loss calculation
+                 tokens_padded = None
+                 tokens_lens_rel = None
+            else:
+                 tokens_padded, tokens_lens_rel = tokens_data
 
             if tokens_eos_padded is None or tokens_eos_padded.numel() == 0:
-                logging.error("Empty target tensor in compute_objectives. Returning zero loss.")
+                logging.error("Empty target tensor (tokens_eos_padded) in compute_objectives. Returning zero loss.")
                 return torch.tensor(0.0, device=self.device, requires_grad=False)
 
             # --- Calculate Loss ---
@@ -1340,7 +1399,7 @@ logging.info("Defining Modal training function...")
 
 @app.function(
     image=modal_image,
-    gpu="H100", 
+    gpu="A100-80GB", 
     cpu=8,
     volumes={CHECKPOINT_DIR: volume},
     secrets=[hf_secret, wandb_secret],
@@ -1612,19 +1671,44 @@ def train_whisper_on_modal():
             }
             if dynamic_batching:
                 max_batch_length_samples = int(hparams.get("max_batch_len_seconds") * hparams.get("target_sample_rate"))
+                # Get num_buckets from hparams
+                num_buckets = hparams.get("dynamic_batch_num_buckets", 60) # Default to 60 if not set
+                logging.info(f"Using dynamic batching with max_batch_length={max_batch_length_samples} samples and num_buckets={num_buckets}.")
+
                 def length_func(item_dict):
                     duration = item_dict.get("duration")
                     if duration is None or not isinstance(duration, (int, float)) or duration < 0: return 0
                     return math.ceil(duration * hparams.get("target_sample_rate"))
                 train_split_name = hparams.get("train_split")
                 if train_split_name and train_split_name in datasets_dict:
-                    train_sampler = DynamicBatchSampler(datasets_dict[train_split_name], max_batch_length=max_batch_length_samples, num_buckets=100, shuffle=True, batch_ordering="random", length_func=length_func)
+                    train_sampler = DynamicBatchSampler(
+                        datasets_dict[train_split_name],
+                        max_batch_length=max_batch_length_samples,
+                        num_buckets=num_buckets, # Use hparam value
+                        shuffle=True,
+                        batch_ordering="random",
+                        length_func=length_func
+                    )
                     train_loader_kwargs = { **loader_common_kwargs, "batch_sampler": train_sampler, "shuffle": False }
                 if hparams.get("valid_split") in datasets_dict:
-                    valid_sampler = DynamicBatchSampler(datasets_dict[hparams.get("valid_split")], max_batch_length=max_batch_length_samples, num_buckets=100, shuffle=False, batch_ordering="random", length_func=length_func)
+                    valid_sampler = DynamicBatchSampler(
+                        datasets_dict[hparams.get("valid_split")],
+                        max_batch_length=max_batch_length_samples,
+                        num_buckets=num_buckets, # Use hparam value
+                        shuffle=False,
+                        batch_ordering="random",
+                        length_func=length_func
+                    )
                     valid_loader_kwargs = { **loader_common_kwargs, "batch_sampler": valid_sampler, "shuffle": False }
                 if hparams.get("test_split") in datasets_dict:
-                    test_sampler = DynamicBatchSampler(datasets_dict[hparams.get("test_split")], max_batch_length=max_batch_length_samples, num_buckets=100, shuffle=False, batch_ordering="random", length_func=length_func)
+                    test_sampler = DynamicBatchSampler(
+                        datasets_dict[hparams.get("test_split")],
+                        max_batch_length=max_batch_length_samples,
+                        num_buckets=num_buckets, # Use hparam value
+                        shuffle=False,
+                        batch_ordering="random",
+                        length_func=length_func
+                    )
                     test_loader_kwargs = { **loader_common_kwargs, "batch_sampler": test_sampler, "shuffle": False }
             else:
                 static_bs = hparams.get("loader_batch_size", 8)
