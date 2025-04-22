@@ -194,16 +194,16 @@ hparams = {
     "augment": True,
     "noise_prob": 0.30,  # Probability for AddNoise
     "reverb_prob": 0.30, # Probability for AddReverb (now standard)
-    "speed_prob": 0.50,  # Probability for SpeedPerturb
-    "pitch_prob": 0.30,  # Probability for PitchShiftWrapper
-    "gain_prob": 0.50,   # Probability for GainWrapper
-    "drop_chunk_prob": 0.30, # Probability for DropChunk
-    "drop_freq_prob": 0.30,  # Probability for DropFreq
-    "clip_prob": 0.30,       # Probability for DoClip
-    "drop_bit_prob": 0.30,   # Probability for DropBitResolution
+    "speed_prob": 0.00,  # Probability for SpeedPerturb
+    "pitch_prob": 0.00,  # Probability for PitchShiftWrapper
+    "gain_prob": 0.00,   # Probability for GainWrapper
+    "drop_chunk_prob": 0.00, # Probability for DropChunk
+    "drop_freq_prob": 0.00,  # Probability for DropFreq
+    "clip_prob": 0.00,       # Probability for DoClip
+    "drop_bit_prob": 0.00,   # Probability for DropBitResolution
 
     "min_augmentations": 1,
-    "max_augmentations": 3,  # Apply from Min to Max from the eligible pool 
+    "max_augmentations": 2,  # Apply from Min to Max from the eligible pool 
 
     # AddNoise Params (NEW/UPDATED)
     "noise_snr_low": 15,
@@ -244,8 +244,8 @@ hparams = {
 
     # Training Params
     "seed": 1986,
-    "epochs": 11,
-    "learning_rate": 1e-6,
+    "epochs": 2,
+    "learning_rate": 1e-5,
     "lr_warmup_steps": 1000,
     "weight_decay": 0.05,
     "lr_annealing_factor": 0.9,
