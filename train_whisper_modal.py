@@ -192,15 +192,17 @@ hparams = {
 
     # Augmentation Params.... this should be a boolean, any value 0 > enables the augmentation 
     "augment": True,
-    "noise_prob": 0.30,  # Probability for AddNoise
-    "reverb_prob": 0.30, # Probability for AddReverb (now standard)
-    "speed_prob": 0.00,  # Probability for SpeedPerturb
-    "pitch_prob": 0.00,  # Probability for PitchShiftWrapper
-    "gain_prob": 0.00,   # Probability for GainWrapper
-    "drop_chunk_prob": 0.00, # Probability for DropChunk
-    "drop_freq_prob": 0.00,  # Probability for DropFreq
-    "clip_prob": 0.00,       # Probability for DoClip
-    "drop_bit_prob": 0.00,   # Probability for DropBitResolution
+    "noise_prob": 1.00,  # Probability for AddNoise
+    "reverb_prob": 1.00, # Probability for AddReverb (now standard)
+    "speed_prob": 1.00,  # Probability for SpeedPerturb
+    "pitch_prob": 1.00,  # Probability for PitchShiftWrapper
+    "gain_prob": 1.00,   # Probability for GainWrapper
+    "drop_chunk_prob": 0.50, # Probability for DropChunk
+    "drop_freq_prob": 0.50,  # Probability for DropFreq
+    "clip_prob": 1.00,       # Probability for DoClip
+    "drop_bit_prob": 1.00,   # Probability for DropBitResolution
+
+    "codec_prob": 1.00,      # Probability for CodecAugment (NEW)
 
     "min_augmentations": 1,
     "max_augmentations": 2,  # Apply from Min to Max from the eligible pool 
@@ -245,11 +247,11 @@ hparams = {
     # Training Params
     "seed": 1986,
     "epochs": 2,
-    "learning_rate": 1e-5,
+    "learning_rate": 1e-5, # Probably a bit high, need to decrease 
     "lr_warmup_steps": 1000,
     "weight_decay": 0.05,
     "lr_annealing_factor": 0.9,
-    "batch_size_dynamic": False, # <--- DISABLED DYNAMIC BATCHING
+    "batch_size_dynamic": False, # DISABLED DYNAMIC BATCHING
     "dynamic_batch_num_buckets": 60, # (Not used when dynamic batching is False)
     "loader_batch_size": 8, # Used only if batch_size_dynamic is False
     "max_batch_len_seconds": 40.0,
@@ -271,7 +273,7 @@ hparams = {
     "wandb_log_batch_freq": 100,  # Log batch metrics every N steps
     "wandb_watch_model": True,  # Whether to watch gradients
     "wandb_watch_freq": 100,  # How often to log gradients
-    "wandb_resume_id": None, # <<< ADD THIS LINE: Set to a run ID string to resume that run
+    "wandb_resume_id": "p81mrn6f", # Set to a run ID string to resume a specific W & B run
 }
 
 # Add a check after hparams definition
@@ -369,6 +371,7 @@ from speechbrain.augment.time_domain import (
     SpeedPerturb, AddNoise, AddReverb, DropChunk, DropFreq,
     DoClip, DropBitResolution
 )
+from speechbrain.augment.codec import CodecAugment # <--- ADD THIS IMPORT
 from speechbrain.augment.augmenter import Augmenter
 import os
 import string
@@ -768,6 +771,19 @@ class WhisperFineTuneBrain(sb.Brain):
                     initialized_augmentations.append("DropBitResolution")
                 except Exception as e:
                     logging.warning(f"Could not initialize DropBitResolution: {e}. Skipping.", exc_info=True)
+
+            # --- Initialize CodecAugment (Forcing g722) --- (NEW)
+            codec_prob = getattr(self.hparams, "codec_prob", 0.0)
+            if codec_prob > 0:
+                try:
+                    codec_augmenter = CodecAugment(sample_rate=target_sr)
+                    # Force g722 codec by overwriting the available list
+                    codec_augmenter.available_format_encoders = [("g722", None)]
+                    sb_augmentations.append(codec_augmenter)
+                    initialized_augmentations.append("CodecAugment (g722 forced)")
+                    logging.info(f"Initialized CodecAugment and forced g722 codec.")
+                except Exception as e:
+                    logging.warning(f"Could not initialize CodecAugment: {e}. Skipping.", exc_info=True)
 
 
             # --- Initialize Augmenter ---
