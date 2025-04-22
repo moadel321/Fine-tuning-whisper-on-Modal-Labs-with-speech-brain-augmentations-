@@ -133,11 +133,14 @@ modal_image = (
         "pandas==2.1.4",
         "soundfile==0.12.1" # Add soundfile explicitly
     )
-    # Download noise assets during image build
+    # Download noise & RIR assets during image build
     .run_commands(
-        "mkdir /noise_assets",
+        "mkdir -p /noise_assets /rir_assets", # Create both directories
+        # Noise files
         "wget https://www.dropbox.com/s/aleer424jumcs08/noise2.wav -O /noise_assets/noise2.wav",
-        "wget https://www.dropbox.com/s/eoxxi2ezr8owk8a/noise3.wav -O /noise_assets/noise3.wav"
+        "wget https://www.dropbox.com/s/eoxxi2ezr8owk8a/noise3.wav -O /noise_assets/noise3.wav",
+        # RIR file (NEW)
+        "wget https://www.dropbox.com/s/pjnub2s5hql2vxs/rir1.wav -O /rir_assets/rir1.wav"
     )
 )
 
@@ -171,7 +174,7 @@ hparams = {
     "train_split": "train",
     "valid_split": "validation",
     "test_split": "test",
-    "rir_dataset_id": "Fhrozen/tau_srir_db",
+    # "rir_dataset_id": "Fhrozen/tau_srir_db", # REMOVED: Replaced by pre-downloaded assets
     "target_sample_rate": TARGET_SAMPLE_RATE,
 
     # Model & Tokenizer
@@ -190,7 +193,7 @@ hparams = {
     # Augmentation Params.... this should be a boolean, any value 0 > enables the augmentation 
     "augment": True,
     "noise_prob": 0.30,  # Probability for AddNoise
-    "reverb_prob": 0.30, # Probability for AddReverb (via RIRSampler)
+    "reverb_prob": 0.30, # Probability for AddReverb (now standard)
     "speed_prob": 0.50,  # Probability for SpeedPerturb
     "pitch_prob": 0.30,  # Probability for PitchShiftWrapper
     "gain_prob": 0.50,   # Probability for GainWrapper
@@ -200,14 +203,16 @@ hparams = {
     "drop_bit_prob": 0.30,   # Probability for DropBitResolution
 
     "min_augmentations": 1,
-    "max_augmentations": 1,  # Apply 1 to 3 from the eligible pool 
+    "max_augmentations": 3,  # Apply from Min to Max from the eligible pool 
 
     # AddNoise Params (NEW/UPDATED)
     "noise_snr_low": 15,
     "noise_snr_high": 25,
 
-    # RIRSampler Params
-    "rir_scale_factor": 1.0, # For RIRSampler
+    # AddReverb Params (NEW - replacing RIRSampler)
+    "rir_assets_dir": "/rir_assets", # Directory containing pre-downloaded/converted RIR WAVs
+    "rir_manifest_path": "/tmp/rir_manifest.csv", # Path for the temporary RIR manifest CSV
+    "rir_scale_factor": 1.0, # Same parameter name used by AddReverb
 
     # SpeedPerturb Params
     "speed_factors": [95, 105],
@@ -545,21 +550,6 @@ class WhisperFineTuneBrain(sb.Brain):
 
             target_sr = getattr(self.hparams, "target_sample_rate", TARGET_SAMPLE_RATE)
 
-            # --- Load RIR Dataset Object ---
-            hparams["rir_dataset_object"] = None
-            if hparams.get("augment", False):
-                try:
-                     rir_ds_id = hparams.get("rir_dataset_id")
-                     if rir_ds_id:
-                          logging.info(f"Loading RIR dataset object: {rir_ds_id}")
-                          try:
-                               rir_ds = load_dataset(rir_ds_id, cache_dir=CACHE_DIR, split="train")
-                               hparams["rir_dataset_object"] = rir_ds
-                               logging.info(f"Loaded RIR dataset object with {len(rir_ds)} samples.")
-                          except Exception as e_rir_load: logging.warning(f"Could not load RIR dataset object {rir_ds_id}: {e_rir_load}", exc_info=True) # Added exc_info
-                except Exception as e: logging.warning(f"General error loading RIR dataset objects: {e}.", exc_info=True) # Added exc_info
-            else: logging.info("Skipping RIR dataset loading as augmentation is disabled.")
-
             # --- Dynamically Create Noise CSV and Initialize AddNoise (REVISED) ---
             noise_prob = getattr(self.hparams, "noise_prob", 0.0)
             fixed_noise_wav_dir = "/noise_assets" # Directory containing the downloaded WAVs
@@ -623,21 +613,63 @@ class WhisperFineTuneBrain(sb.Brain):
                     logging.warning(f"Could not create noise manifest or initialize AddNoise: {e_create_manifest}. Skipping AddNoise.", exc_info=True)
                     noise_manifest_path = None # Ensure path is None on error
 
-            # --- Initialize RIRSampler using dataset object ---
-            # (Keep RIRSampler as is, using direct HF dataset access for reverb)
-            rir_dataset = getattr(self.hparams, "rir_dataset_object", None)
+            # --- Initialize AddReverb using dynamically created manifest (NEW) ---
             reverb_prob = getattr(self.hparams, "reverb_prob", 0.0)
-            if reverb_prob > 0 and rir_dataset is not None:
+            rir_assets_dir = getattr(self.hparams, "rir_assets_dir", "/rir_assets") # Get dir from hparams
+            rir_manifest_path = getattr(self.hparams, "rir_manifest_path", os.path.join(self._temp_dir, "rir_manifest.csv")) # Get manifest path
+
+            if reverb_prob > 0:
+                logging.info(f"Attempting to initialize AddReverb. Looking for RIR WAVs in: {rir_assets_dir}")
                 try:
-                    reverb_sampler = RIRSampler(
-                        rir_dataset=rir_dataset,
-                        rir_scale_factor=1.0,
-                        target_sample_rate=target_sr
-                    )
-                    sb_augmentations.append(reverb_sampler)
-                    initialized_augmentations.append("RIRSampler")
-                except Exception as e:
-                    logging.warning(f"Could not initialize RIRSampler: {e}. Skipping.", exc_info=True)
+                    # Ensure the assets directory exists (should have been created in Dockerfile)
+                    if not os.path.isdir(rir_assets_dir):
+                         logging.warning(f"RIR assets directory {rir_assets_dir} not found. Skipping AddReverb.")
+                    else:
+                        rir_files = [f for f in os.listdir(rir_assets_dir) if f.endswith('.wav')]
+                        if not rir_files:
+                            logging.warning(f"No WAV files found in {rir_assets_dir}. Cannot create RIR manifest. Skipping AddReverb.")
+                        else:
+                            logging.info(f"Found RIR WAV files: {rir_files}")
+                            # Create the RIR manifest CSV
+                            with open(rir_manifest_path, 'w', newline='', encoding='utf-8') as outfile:
+                                writer = csv.writer(outfile)
+                                header = ["ID", "duration", "wav", "wav_format", "wav_opts"]
+                                writer.writerow(header)
+
+                                for rir_file in rir_files:
+                                    file_id = os.path.splitext(rir_file)[0]
+                                    full_path = os.path.join(rir_assets_dir, rir_file)
+                                    duration = 0.0
+                                    try:
+                                        info = torchaudio.info(full_path)
+                                        duration = info.num_frames / info.sample_rate
+                                        if duration <= 0:
+                                            logging.warning(f"Invalid duration for RIR {rir_file}. Skipping.")
+                                            continue
+                                    except Exception as e_info:
+                                        logging.warning(f"Could not get info for RIR {rir_file}: {e_info}. Skipping.", exc_info=True)
+                                        continue
+
+                                    writer.writerow([file_id, f"{duration:.2f}", full_path, "wav", ""])
+                            logging.info(f"RIR manifest created at {rir_manifest_path}.")
+
+                            # Check if manifest is valid before initializing AddReverb
+                            if os.path.exists(rir_manifest_path) and os.path.getsize(rir_manifest_path) > len(",".join(header).encode('utf-8')):
+                                reverb_adder = AddReverb(
+                                    csv_file=rir_manifest_path,
+                                    rir_scale_factor=getattr(self.hparams, "rir_scale_factor", 1.0),
+                                    reverb_sample_rate=target_sr, # Assume RIRs are at target SR
+                                    clean_sample_rate=target_sr
+                                )
+                                sb_augmentations.append(reverb_adder)
+                                initialized_augmentations.append("AddReverb")
+                                logging.info("Successfully initialized AddReverb with dynamically created manifest.")
+                            else:
+                                logging.warning("Dynamically created RIR manifest is empty or invalid. Skipping AddReverb initialization.")
+
+                except Exception as e_create_rir_manifest:
+                    logging.warning(f"Could not create RIR manifest or initialize AddReverb: {e_create_rir_manifest}. Skipping AddReverb.", exc_info=True)
+
 
             # --- Initialize SpeedPerturb ---
             speed_prob = getattr(self.hparams, "speed_prob", 0.0)  # Get probability but don't use it
