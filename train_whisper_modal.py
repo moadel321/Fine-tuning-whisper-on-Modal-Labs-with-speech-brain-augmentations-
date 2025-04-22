@@ -187,7 +187,7 @@ hparams = {
     "pad_token_id": token_info["pad_token_id"] if token_info else 50257,
     "decoder_start_ids": token_info["decoder_start_ids"] if token_info else [50258, 50361, 50359, 50363],
 
-    # Augmentation Params
+    # Augmentation Params.... this should be a boolean, any value 0 > enables the augmentation 
     "augment": True,
     "noise_prob": 0.30,  # Probability for AddNoise
     "reverb_prob": 0.30, # Probability for AddReverb (via RIRSampler)
@@ -200,7 +200,7 @@ hparams = {
     "drop_bit_prob": 0.30,   # Probability for DropBitResolution
 
     "min_augmentations": 1,
-    "max_augmentations": 1,  # Apply 1 to 3 from the eligible pool (updated later)
+    "max_augmentations": 1,  # Apply 1 to 3 from the eligible pool 
 
     # AddNoise Params (NEW/UPDATED)
     "noise_snr_low": 15,
@@ -751,7 +751,7 @@ class WhisperFineTuneBrain(sb.Brain):
                         min_augmentations=getattr(self.hparams, "min_augmentations", 1),
                         max_augmentations=effective_max_augmentations,
                         shuffle_augmentations=True,
-                        augment_prob=1.0,
+                        augment_prob=0.5,
                         augmentations=sb_augmentations,
                     )
                     aug_names = [type(aug).__name__ for aug in sb_augmentations]
@@ -791,21 +791,57 @@ class WhisperFineTuneBrain(sb.Brain):
 
             wavs = signals  # Start with original signals
             wav_lens = signal_lens # Start with original relative lengths
+            applied_augs_list = [] # List to store names of applied augmentations for logging
+            augmentation_applied_this_batch = False # Flag to track if augmentation happened
 
             # ***** Apply SpeechBrain Augmenter to the whole batch *****
             if stage == sb.Stage.TRAIN and getattr(self.hparams, "augment", False) and self.augmenter is not None:
-                try:
-                    # Note: Augmenter expects [batch, time, channels] or [batch, time]
-                    # Ensure signals has the right shape if needed (might need unsqueeze/squeeze later)
-                    # Pass the relative lengths tensor directly
-                    wavs, wav_lens = self.augmenter(wavs, wav_lens)
-                    logging.debug("Applied SpeechBrain Augmenter to batch.") # Optional debug log
+                # Check probability BEFORE calling augmenter
+                if random.random() < self.augmenter.augment_prob:
+                    try:
+                        # --- Replicate selection logic for logging --- 
+                        min_aug = max(0, self.augmenter.min_augmentations)
+                        max_aug = max(min_aug, self.augmenter.max_augmentations)
+                        num_available_augs = len(self.augmenter.augmentations)
+                        
+                        selected_augmentations_for_log = [] # Reset list for this batch
+                        if max_aug > 0 and num_available_augs > 0:
+                            N_augment = torch.randint(
+                                low=min_aug,
+                                high=min(max_aug, num_available_augs) + 1, # Ensure high doesn't exceed available
+                                size=(1,),
+                            ).item()
 
-                except Exception as aug_e:
-                    logging.warning(f"Batch Augmentation failed: {aug_e}. Using original batch.", exc_info=True)
-                    wavs = signals # Revert to original if augmentation fails
-                    wav_lens = signal_lens
+                            if N_augment > 0:
+                                augmentations_lst = list(self.augmenter.augmentations.keys())
+                                if self.augmenter.shuffle_augmentations:
+                                    random.shuffle(augmentations_lst)
+                                # Select the names
+                                selected_augmentations_for_log = augmentations_lst[0:N_augment]
+                                applied_augs_list = selected_augmentations_for_log # Store for logging after call
+                                augmentation_applied_this_batch = True # Mark that we intend to augment
+                                
+                                # --- Now actually call the augmenter --- 
+                                # NOTE: The augmenter performs its own selection internally.
+                                # Our logging reflects the selection *predicted* by replicating the logic.
+                                wavs, wav_lens = self.augmenter(wavs, wav_lens)
 
+                        # Log the selection (or lack thereof) at DEBUG level
+                        logging.debug(f"Augmenter Selection: Target N={N_augment if 'N_augment' in locals() else 'N/A'}, Selected Keys={selected_augmentations_for_log if selected_augmentations_for_log else 'None'}")
+
+                    except Exception as aug_e:
+                        logging.warning(f"Batch Augmentation failed: {aug_e}. Using original batch.", exc_info=True)
+                        wavs = signals # Revert to original if augmentation fails
+                        wav_lens = signal_lens
+                        applied_augs_list = [f"Error: {type(aug_e).__name__}"]
+                        augmentation_applied_this_batch = False # Augmentation failed
+                # else: # Optional: Log if probability check failed
+                #    logging.debug(f"Skipped augmentation this batch due to augment_prob: {self.augmenter.augment_prob}")
+
+            # --- Log applied augmentations (if any) --- 
+            # This logs the list captured *before* the augmenter was called, reflecting the *intended* selection
+            # Log level can be adjusted (e.g., INFO if you want it more prominent)
+            logging.debug(f"Batch Augmentations Applied (Predicted): {applied_augs_list if augmentation_applied_this_batch else 'None'}")
 
             try:
                 tokens_list = [self.tokenizer.encode(t) for t in texts]
