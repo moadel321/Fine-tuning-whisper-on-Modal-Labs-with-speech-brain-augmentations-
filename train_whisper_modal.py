@@ -192,20 +192,19 @@ hparams = {
 
     # Augmentation Params.... this should be a boolean, any value 0 > enables the augmentation 
     "augment": True,
-    "noise_prob": 1.00,  # Probability for AddNoise
-    "reverb_prob": 1.00, # Probability for AddReverb (now standard)
-    "speed_prob": 1.00,  # Probability for SpeedPerturb
-    "pitch_prob": 1.00,  # Probability for PitchShiftWrapper
-    "gain_prob": 1.00,   # Probability for GainWrapper
+    "noise_prob": 0.00,  # Probability for AddNoise
+    "reverb_prob": 0.00, # Probability for AddReverb (now standard)
+    "speed_prob": 0.00,  # Probability for SpeedPerturb
+    "pitch_prob": 0.00,  # Probability for PitchShiftWrapper
+    "gain_prob": 0.00,   # Probability for GainWrapper
     "drop_chunk_prob": 0.50, # Probability for DropChunk
     "drop_freq_prob": 0.50,  # Probability for DropFreq
-    "clip_prob": 1.00,       # Probability for DoClip
-    "drop_bit_prob": 1.00,   # Probability for DropBitResolution
-
-    "codec_prob": 1.00,      # Probability for CodecAugment (NEW)
+    "clip_prob": 0.00,       # Probability for DoClip
+    "drop_bit_prob": 0.50,   # Probability for DropBitResolution
+    "codec_prob": 0.00,      # Probability for CodecAugment 
 
     "min_augmentations": 1,
-    "max_augmentations": 2,  # Apply from Min to Max from the eligible pool 
+    "max_augmentations": 3,  # Apply from Min to Max from the eligible pool 
 
     # AddNoise Params (NEW/UPDATED)
     "noise_snr_low": 15,
@@ -244,6 +243,12 @@ hparams = {
     # DropBitResolution Params (REVISED)
     # No low/high needed, target_dtype='random' is default in class
 
+    # CodecAugment Params (NEW)
+    # No specific params needed for basic g722 forced usage
+
+    # Augmenter Master Probability (NEW - To log to WandB)
+    "augment_prob_master": 0.50, # Overall probability the Augmenter is applied
+
     # Training Params
     "seed": 1986,
     "epochs": 2,
@@ -273,7 +278,7 @@ hparams = {
     "wandb_log_batch_freq": 100,  # Log batch metrics every N steps
     "wandb_watch_model": True,  # Whether to watch gradients
     "wandb_watch_freq": 100,  # How often to log gradients
-    "wandb_resume_id": "p81mrn6f", # Set to a run ID string to resume a specific W & B run
+    "wandb_resume_id": None, # Set to a run ID string to resume a specific W & B run
 }
 
 # Add a check after hparams definition
@@ -799,7 +804,7 @@ class WhisperFineTuneBrain(sb.Brain):
                         min_augmentations=getattr(self.hparams, "min_augmentations", 1),
                         max_augmentations=effective_max_augmentations,
                         shuffle_augmentations=True,
-                        augment_prob=0.5,
+                        augment_prob=getattr(self.hparams, "augment_prob_master", 0.50), # Use value from hparams
                         augmentations=sb_augmentations,
                     )
                     aug_names = [type(aug).__name__ for aug in sb_augmentations]
