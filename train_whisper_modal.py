@@ -139,7 +139,7 @@ modal_image = (
         # Noise files
         "wget https://www.dropbox.com/s/aleer424jumcs08/noise2.wav -O /noise_assets/noise2.wav",
         "wget https://www.dropbox.com/s/eoxxi2ezr8owk8a/noise3.wav -O /noise_assets/noise3.wav",
-        # RIR file (NEW)
+        # RIR file
         "wget https://www.dropbox.com/s/pjnub2s5hql2vxs/rir1.wav -O /rir_assets/rir1.wav"
     )
 )
@@ -190,72 +190,79 @@ hparams = {
     "pad_token_id": token_info["pad_token_id"] if token_info else 50257,
     "decoder_start_ids": token_info["decoder_start_ids"] if token_info else [50258, 50361, 50359, 50363],
 
-    # Augmentation Params.... this should be a boolean, any value 0 > enables the augmentation 
-    "augment": True,
-    "noise_prob": 0.00,  # Probability for AddNoise
-    "reverb_prob": 0.00, # Probability for AddReverb (now standard)
-    "speed_prob": 0.00,  # Probability for SpeedPerturb
-    "pitch_prob": 0.00,  # Probability for PitchShiftWrapper
-    "gain_prob": 0.00,   # Probability for GainWrapper
-    "drop_chunk_prob": 0.50, # Probability for DropChunk
-    "drop_freq_prob": 0.50,  # Probability for DropFreq
-    "clip_prob": 0.00,       # Probability for DoClip
-    "drop_bit_prob": 0.50,   # Probability for DropBitResolution
-    "codec_prob": 0.00,      # Probability for CodecAugment 
+    # === Augmentation Configuration ===
+    "augment": True, # Master switch for augmentation
+    "augment_prob_master": 0.50, # Overall probability the Augmenter chain is applied per batch
 
-    "min_augmentations": 1,
-    "max_augmentations": 3,  # Apply from Min to Max from the eligible pool 
+    # --- Boolean flags to enable specific augmentations ---
+    "use_add_noise": False,          # Set to True to enable AddNoise
+    "use_add_reverb": False,         # Set to True to enable AddReverb
+    "use_speed_perturb": False,      # Set to True to enable SpeedPerturb
+    "use_pitch_shift": False,        # Set to True to enable PitchShiftWrapper
+    "use_gain": False,               # Set to True to enable GainWrapper
+    "use_drop_chunk": True,          # Set to True to enable DropChunk (Original prob was 0.50)
+    "use_drop_freq": True,           # Set to True to enable DropFreq (Original prob was 0.50)
+    "use_do_clip": False,            # Set to True to enable DoClip
+    "use_drop_bit_resolution": True, # Set to True to enable DropBitResolution (Original prob was 0.50)
+    "use_codec_augment": False,      # Set to True to enable CodecAugment
 
-    # AddNoise Params (NEW/UPDATED)
+    # --- Parameters for *enabled* augmentations ---
+    "min_augmentations": 1, # Min number of augmentations to apply *from the enabled pool*
+    "max_augmentations": 3, # Max number of augmentations to apply *from the enabled pool*
+
+    # AddNoise Params (Used if use_add_noise is True)
     "noise_snr_low": 15,
     "noise_snr_high": 25,
 
-    # AddReverb Params (NEW - replacing RIRSampler)
-    "rir_assets_dir": "/rir_assets", # Directory containing pre-downloaded/converted RIR WAVs
-    "rir_manifest_path": "/tmp/rir_manifest.csv", # Path for the temporary RIR manifest CSV
-    "rir_scale_factor": 1.0, # Same parameter name used by AddReverb
+    # AddReverb Params (Used if use_add_reverb is True)
+    "rir_assets_dir": "/rir_assets",
+    "rir_manifest_path": "/tmp/rir_manifest.csv",
+    "rir_scale_factor": 1.0,
 
-    # SpeedPerturb Params
+    # SpeedPerturb Params (Used if use_speed_perturb is True)
     "speed_factors": [95, 105],
 
-    # PitchShiftWrapper Params
+    # PitchShiftWrapper Params (Used if use_pitch_shift is True)
     "pitch_steps_low": -1,
     "pitch_steps_high": 1,
 
-    # GainWrapper Params
+    # GainWrapper Params (Used if use_gain is True)
     "gain_db_low": -4,
     "gain_db_high": 4,
 
-    # DropChunk Params
+    # DropChunk Params (Used if use_drop_chunk is True)
     "drop_chunk_length_low": 1600,
     "drop_chunk_length_high": 4800,
     "drop_chunk_count_low": 1,
     "drop_chunk_count_high": 5,
 
-    # DropFreq Params
+    # DropFreq Params (Used if use_drop_freq is True)
     "drop_freq_count_low": 1,
     "drop_freq_count_high": 3,
 
-    # DoClip Params
+    # DoClip Params (Used if use_do_clip is True)
     "clip_low": 0.7,
     "clip_high": 0.9,
 
-    # DropBitResolution Params (REVISED)
-    # No low/high needed, target_dtype='random' is default in class
+    # DropBitResolution Params (Used if use_drop_bit_resolution is True)
+    # No specific params needed, uses default internal logic
 
-    # CodecAugment Params (NEW)
-    # No specific params needed for basic g722 forced usage
+    # CodecAugment Params (Used if use_codec_augment is True)
+    # No specific params needed for forced g722
 
-    # Augmenter Master Probability (NEW - To log to WandB)
-    "augment_prob_master": 0.50, # Overall probability the Augmenter is applied
+    # === End Augmentation Configuration ===
 
     # Training Params
     "seed": 1986,
     "epochs": 2,
-    "learning_rate": 1e-5, # Probably a bit high, need to decrease 
+    "learning_rate": 1e-5, # Probably a bit high, need to decrease
+    "optimizer_type": "AdamW", # Added for tracking
+    "scheduler_type": "NewBob", # Added for tracking
+    "lr_improvement_threshold": 0.0025, # Default for NewBobScheduler (added for tracking)
+    "lr_patient": 0, # Default for NewBobScheduler (added for tracking)
     "lr_warmup_steps": 1000,
     "weight_decay": 0.05,
-    "lr_annealing_factor": 0.9,
+    "lr_annealing_factor": 0.9, # Used by NewBobScheduler
     "batch_size_dynamic": False, # DISABLED DYNAMIC BATCHING
     "dynamic_batch_num_buckets": 60, # (Not used when dynamic batching is False)
     "loader_batch_size": 8, # Used only if batch_size_dynamic is False
@@ -559,12 +566,10 @@ class WhisperFineTuneBrain(sb.Brain):
             target_sr = getattr(self.hparams, "target_sample_rate", TARGET_SAMPLE_RATE)
 
             # --- Dynamically Create Noise CSV and Initialize AddNoise (REVISED) ---
-            noise_prob = getattr(self.hparams, "noise_prob", 0.0)
-            fixed_noise_wav_dir = "/noise_assets" # Directory containing the downloaded WAVs
             noise_manifest_path = os.path.join(self._temp_dir, "noise_manifest.csv")
-
-            if noise_prob > 0:
-                logging.info(f"Dynamically creating noise manifest at: {noise_manifest_path}")
+            if getattr(self.hparams, "use_add_noise", False):
+                logging.info(f"Attempting AddNoise initialization. Dynamically creating noise manifest at: {noise_manifest_path}")
+                fixed_noise_wav_dir = "/noise_assets" # Directory containing the downloaded WAVs
                 try:
                     # List WAV files in the noise assets directory
                     noise_files = [f for f in os.listdir(fixed_noise_wav_dir) if f.endswith('.wav')]
@@ -680,11 +685,9 @@ class WhisperFineTuneBrain(sb.Brain):
 
 
             # --- Initialize SpeedPerturb ---
-            speed_prob = getattr(self.hparams, "speed_prob", 0.0)  # Get probability but don't use it
-            if speed_prob > 0 and hasattr(self.hparams, "speed_factors"):
+            if getattr(self.hparams, "use_speed_perturb", False):
                 try:
                     speeds = [factor / 100.0 for factor in self.hparams.speed_factors]
-                    # Initialize WITHOUT perturb_prob (will use default 1.0)
                     speed_perturber = SpeedPerturb(
                         orig_freq=target_sr,
                         speeds=speeds,
@@ -696,8 +699,7 @@ class WhisperFineTuneBrain(sb.Brain):
                     logging.warning(f"Could not initialize SpeedPerturb: {e}. Skipping.", exc_info=True)
 
             # --- Initialize DropChunk ---
-            drop_chunk_prob = getattr(self.hparams, "drop_chunk_prob", 0.0)
-            if drop_chunk_prob > 0:
+            if getattr(self.hparams, "use_drop_chunk", False):
                 try:
                     drop_chunk = DropChunk(
                         drop_length_low=self.hparams.drop_chunk_length_low,
@@ -711,8 +713,7 @@ class WhisperFineTuneBrain(sb.Brain):
                     logging.warning(f"Could not initialize DropChunk: {e}. Skipping.", exc_info=True)
 
             # --- Initialize DropFreq ---
-            drop_freq_prob = getattr(self.hparams, "drop_freq_prob", 0.0)
-            if drop_freq_prob > 0:
+            if getattr(self.hparams, "use_drop_freq", False):
                 try:
                     drop_freq = DropFreq(
                         drop_freq_count_low=self.hparams.drop_freq_count_low,
@@ -724,11 +725,10 @@ class WhisperFineTuneBrain(sb.Brain):
                     logging.warning(f"Could not initialize DropFreq: {e}. Skipping.", exc_info=True)
 
             # --- Initialize PitchShiftWrapper ---
-            pitch_prob = getattr(self.hparams, "pitch_prob", 0.0)
-            if pitch_prob > 0:
+            if getattr(self.hparams, "use_pitch_shift", False):
                 try:
                     pitch_shifter = PitchShiftWrapper(
-                        prob=pitch_prob, # Pass prob for internal check
+                        prob=1.0, # Apply if selected by Augmenter
                         pitch_steps_low=self.hparams.pitch_steps_low,
                         pitch_steps_high=self.hparams.pitch_steps_high,
                         sample_rate=target_sr,
@@ -739,11 +739,10 @@ class WhisperFineTuneBrain(sb.Brain):
                     logging.warning(f"Could not initialize PitchShiftWrapper: {e}. Skipping.", exc_info=True)
 
             # --- Initialize GainWrapper ---
-            gain_prob = getattr(self.hparams, "gain_prob", 0.0)
-            if gain_prob > 0:
+            if getattr(self.hparams, "use_gain", False):
                 try:
                     gain_adjuster = GainWrapper(
-                        prob=gain_prob, # Pass prob for internal check
+                        prob=1.0, # Apply if selected by Augmenter
                         gain_db_low=self.hparams.gain_db_low,
                         gain_db_high=self.hparams.gain_db_high,
                     )
@@ -753,8 +752,7 @@ class WhisperFineTuneBrain(sb.Brain):
                     logging.warning(f"Could not initialize GainWrapper: {e}. Skipping.", exc_info=True)
 
             # --- Initialize DoClip (NEW) ---
-            clip_prob = getattr(self.hparams, "clip_prob", 0.0)
-            if clip_prob > 0:
+            if getattr(self.hparams, "use_do_clip", False):
                 try:
                     clipper = DoClip(
                         clip_low=self.hparams.clip_low,
@@ -767,8 +765,7 @@ class WhisperFineTuneBrain(sb.Brain):
                     logging.warning(f"Could not initialize DoClip: {e}. Skipping.", exc_info=True)
 
             # --- Initialize DropBitResolution (REVISED) ---
-            drop_bit_prob = getattr(self.hparams, "drop_bit_prob", 0.0)
-            if drop_bit_prob > 0:
+            if getattr(self.hparams, "use_drop_bit_resolution", False):
                 try:
                     # Initialize correctly with no args (uses default target_dtype='random')
                     bit_dropper = DropBitResolution()
@@ -778,8 +775,7 @@ class WhisperFineTuneBrain(sb.Brain):
                     logging.warning(f"Could not initialize DropBitResolution: {e}. Skipping.", exc_info=True)
 
             # --- Initialize CodecAugment (Forcing g722) --- (NEW)
-            codec_prob = getattr(self.hparams, "codec_prob", 0.0)
-            if codec_prob > 0:
+            if getattr(self.hparams, "use_codec_augment", False):
                 try:
                     codec_augmenter = CodecAugment(sample_rate=target_sr)
                     # Force g722 codec by overwriting the available list
