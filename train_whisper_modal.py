@@ -200,15 +200,15 @@ hparams = {
     "use_speed_perturb": False,      # Set to True to enable SpeedPerturb
     "use_pitch_shift": False,        # Set to True to enable PitchShiftWrapper
     "use_gain": False,               # Set to True to enable GainWrapper
-    "use_drop_chunk": True,          # Set to True to enable DropChunk (Original prob was 0.50)
-    "use_drop_freq": True,           # Set to True to enable DropFreq (Original prob was 0.50)
+    "use_drop_chunk": True,          # Set to True to enable DropChunk 
+    "use_drop_freq": True,           # Set to True to enable DropFreq 
     "use_do_clip": False,            # Set to True to enable DoClip
-    "use_drop_bit_resolution": True, # Set to True to enable DropBitResolution (Original prob was 0.50)
+    "use_drop_bit_resolution": True, # Set to True to enable DropBitResolution 
     "use_codec_augment": False,      # Set to True to enable CodecAugment
 
     # --- Parameters for *enabled* augmentations ---
-    "min_augmentations": 1, # Min number of augmentations to apply *from the enabled pool*
-    "max_augmentations": 3, # Max number of augmentations to apply *from the enabled pool*
+    "min_augmentations": 1, # Min number of augmentations to apply from the enabled pool
+    "max_augmentations": 3, # Max number of augmentations to apply from the enabled pool
 
     # AddNoise Params (Used if use_add_noise is True)
     "noise_snr_low": 15,
@@ -244,11 +244,6 @@ hparams = {
     "clip_low": 0.7,
     "clip_high": 0.9,
 
-    # DropBitResolution Params (Used if use_drop_bit_resolution is True)
-    # No specific params needed, uses default internal logic
-
-    # CodecAugment Params (Used if use_codec_augment is True)
-    # No specific params needed for forced g722
 
     # === End Augmentation Configuration ===
 
@@ -258,8 +253,8 @@ hparams = {
     "learning_rate": 1e-5, # Probably a bit high, need to decrease
     "optimizer_type": "AdamW", # Added for tracking
     "scheduler_type": "NewBob", # Added for tracking
-    "lr_improvement_threshold": 0.0025, # Default for NewBobScheduler (added for tracking)
-    "lr_patient": 0, # Default for NewBobScheduler (added for tracking)
+    "lr_improvement_threshold": 0.0025, # Default for NewBobScheduler 
+    "lr_patient": 0, # Default for NewBobScheduler 
     "lr_warmup_steps": 1000,
     "weight_decay": 0.05,
     "lr_annealing_factor": 0.9, # Used by NewBobScheduler
