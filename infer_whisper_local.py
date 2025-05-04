@@ -11,6 +11,10 @@ from bidi.algorithm import get_display
 from openai import OpenAI
 import azure.cognitiveservices.speech as speechsdk
 import time # For Azure wait loop
+from dotenv import load_dotenv # Import dotenv
+
+# --- Load Environment Variables --- 
+load_dotenv() # Load variables from .env file into environment
 
 # --- Basic Logging Setup ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -69,16 +73,12 @@ def load_model_from_speechbrain_ckpt(model_hub, ckpt_path, device):
                       sb_state_dict = checkpoint['whisper'] # If it's already the state dict
                       logging.info("Found state dict under 'whisper' key (dictionary).")
             elif checkpoint: # Check if the checkpoint dict itself is not empty
-                 # Assume the checkpoint itself is the state dict if keys look like model params
-                 # (A more robust check could be added here if needed)
                  logging.info("Keys 'model' or 'whisper' not found. Assuming the checkpoint file directly contains the state dict.")
                  sb_state_dict = checkpoint
             else:
                  logging.error("Checkpoint dictionary is empty or invalid after loading.")
                  return None, None
         else:
-             # If checkpoint is not a dict, maybe it's the raw state_dict saved directly?
-             # This case is less common with SpeechBrain Checkpointer but possible.
              logging.warning("Checkpoint loaded is not a dictionary. Attempting to use it directly as state_dict.")
              sb_state_dict = checkpoint # Treat the loaded object itself as the state_dict
 
@@ -151,15 +151,16 @@ def transcribe_local(processor, model, audio_waveform, language, task, device, n
         processor.tokenizer.set_prefix_tokens(language=language, task=task)
 
         # The processor expects a raw waveform numpy array or list of floats
-        input_features = processor(audio_waveform.numpy(), sampling_rate=16000, return_tensors="pt").input_features
-        input_features = input_features.to(device)
+        processor_output = processor(audio_waveform.numpy(), sampling_rate=16000, return_tensors="pt")
+        input_features = processor_output.input_features.to(device)
+        # Create an attention mask of all ones for the input features
+        attention_mask = torch.ones(input_features.shape[:2], dtype=torch.long, device=device)
+
     except Exception as e:
         logging.error(f"Error during local feature extraction: {e}", exc_info=True)
         return "Local feature extraction failed."
 
     # --- Generate token IDs ---
-    # Prepare the decoder input IDs for generation (SOT, lang, task, no_timestamps)
-    # We get the specific IDs from the *processor's tokenizer*
     decoder_start_token_id = model.config.decoder_start_token_id # Usually SOT <|startoftranscript|>
     lang_token_id = processor.tokenizer.convert_tokens_to_ids(f"<|{language}|>")
     task_token_id = processor.tokenizer.convert_tokens_to_ids(f"<|{task}|>")
@@ -184,9 +185,9 @@ def transcribe_local(processor, model, audio_waveform, language, task, device, n
     logging.info(f"Generating local transcription (num_beams={num_beams})...")
     try:
         with torch.no_grad(): # Disable gradient calculations for inference
-            # Use the model's generate method
             predicted_ids = model.generate(
-                input_features,
+                input_features=input_features,      # Pass input features
+                attention_mask=attention_mask,    # Pass the created attention mask
                 forced_decoder_ids=forced_decoder_ids,
                 max_length=model.config.max_length, # Use model's default max length
                 num_beams=num_beams,
@@ -276,11 +277,11 @@ if __name__ == "__main__":
     parser.add_argument("--task", type=str, default="transcribe", help="Task token for local model ('transcribe' or 'translate').")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device for local model inference ('cuda' or 'cpu').")
     parser.add_argument("--num_beams", type=int, default=5, help="Number of beams for local model beam search decoding.")
-    # OpenAI args
-    parser.add_argument("--openai_api_key", type=str, default=None, help="Your OpenAI API key.")
-    # Azure args
-    parser.add_argument("--azure_speech_key", type=str, default=None, help="Your Azure Speech resource key.")
-    parser.add_argument("--azure_service_region", type=str, default=None, help="Your Azure Speech service region (e.g., 'westeurope').")
+    # OpenAI args - Use environment variable as default if CLI arg is not provided
+    parser.add_argument("--openai_api_key", type=str, default=os.getenv("OPENAI_API_KEY"), help="Your OpenAI API key (can also be set via OPENAI_API_KEY env variable).")
+    # Azure args - Use environment variables as defaults if CLI args are not provided
+    parser.add_argument("--azure_speech_key", type=str, default=os.getenv("AZURE_SPEECH_KEY"), help="Your Azure Speech resource key (can also be set via AZURE_SPEECH_KEY env variable).")
+    parser.add_argument("--azure_service_region", type=str, default=os.getenv("AZURE_SERVICE_REGION"), help="Your Azure Speech service region (e.g., 'westeurope') (can also be set via AZURE_SERVICE_REGION env variable).")
     parser.add_argument("--azure_language_locale", type=str, default="ar-EG", help="Azure language locale (e.g., 'ar-EG', 'ar-SA', 'en-US').")
     # Output args
     parser.add_argument("--output_dir", type=str, default=".", help="Directory to save transcription text files.")

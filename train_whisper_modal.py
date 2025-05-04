@@ -6,14 +6,12 @@ import csv  # Add csv import for augmentation file handling
 import shutil  # For cleanup
 import math
 import torch.nn.functional as F
-from speechbrain.processing.signal_processing import compute_amplitude, dB_to_amplitude, reverberate
+from speechbrain.processing.signal_processing import  reverberate
 from datasets import load_dataset  # Global import for dataset loading in Brain
 
 # Turn off tokenizers parallelism warnings
 import os
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
-
-# Full Corrected Script V4 (Fix SimpleNamespace error, Add Gradient Clipping)
 
 # Cell 1: Basic Modal Setup
 
@@ -86,15 +84,15 @@ def verify_whisper_tokens(model_name="openai/whisper-small", language="ar", task
 print("Defining Modal App basics...")
 
 # --- Modal App Setup ---
-app = modal.App("speechbrain-whisper-finetune-egyptian")
+app = modal.App("name-of-your-app") # Placeholder : name your modal app here 
 
 # --- Secrets ---
-hf_secret = modal.Secret.from_name("huggingface-secret-write")
+hf_secret = modal.Secret.from_name("huggingface-secret-write") # Define the huggingface secret object
 wandb_secret = modal.Secret.from_name("wandb-secret") # Define the wandb secret object
 
 # --- Persistent Storage ---
 volume = modal.Volume.from_name(
-    "speechbrain-finetune-storage", create_if_missing=True
+    "name-of-your-volume", create_if_missing=True # Placeholder : name your volume here 
 )
 CACHE_DIR = "/cache" # HF cache inside container
 CHECKPOINT_DIR = "/root/checkpoints" # Mount point inside container
@@ -105,20 +103,20 @@ modal_image = (
     .apt_install(
         "build-essential", "cmake", "libboost-all-dev",
         "libeigen3-dev", "git", "libsndfile1", "ffmpeg",
-        "wget" # Add wget for downloading noise files
+        "wget" 
     )
     .pip_install(
         "pip==23.3.2",
         "setuptools==69.0.3",
         "wheel==0.42.0",
-        "pyarrow==15.0.0",      # Pin pyarrow *before* datasets (Check compatibility!)
+        "pyarrow==15.0.0",      
         # Core ML libraries
         "torch==2.1.2",  # Latest stable that's well-tested with Whisper
         "torchaudio==2.1.2",  # Matching torch version
         "torchvision==0.16.2", # Add torchvision, compatible with torch 2.1.2
         "transformers==4.51.3",  # Use latest
         "accelerate==0.25.0",  # Latest stable
-        "wandb",  # <-- ADD WANDB HERE
+        "wandb",  
         # SpeechBrain and audio processing
         "speechbrain==1.0.3",  # Latest stable
         "librosa==0.10.1",  # Latest stable
@@ -131,9 +129,9 @@ modal_image = (
         "pyyaml==6.0.1",
         "tqdm==4.66.1",
         "pandas==2.1.4",
-        "soundfile==0.12.1" # Add soundfile explicitly
+        "soundfile==0.12.1"
     )
-    # Download noise & RIR assets during image build
+    # Download noise & RIR WAVs during image build, you will want to change this to increase the number of files 
     .run_commands(
         "mkdir -p /noise_assets /rir_assets", # Create both directories
         # Noise files
@@ -170,15 +168,14 @@ TARGET_SAMPLE_RATE = 16000 # Define target sample rate globally
 
 hparams = {
     # Data
-    "hf_dataset_id": "MAdel121/arabic-egy-cleaned",
+    "hf_dataset_id": "huggingfaceusername/datasetname", # Placeholder : Change this if you want to use a different dataset
     "train_split": "train",
     "valid_split": "validation",
     "test_split": "test",
-    # "rir_dataset_id": "Fhrozen/tau_srir_db", # REMOVED: Replaced by pre-downloaded assets
     "target_sample_rate": TARGET_SAMPLE_RATE,
 
     # Model & Tokenizer
-    "whisper_hub": "openai/whisper-small",
+    "whisper_hub": "openai/whisper-small", # Placeholder : Change this if you want to use a different whisper model
     "save_folder": f"{CHECKPOINT_DIR}/whisper_small_egy_save",
     "output_folder": f"{CHECKPOINT_DIR}/whisper_small_egy_output",
     "language": "ar",
@@ -244,12 +241,11 @@ hparams = {
     "clip_low": 0.7,
     "clip_high": 0.9,
 
-
     # === End Augmentation Configuration ===
 
     # Training Params
     "seed": 1986,
-    "epochs": 2,
+    "epochs": 10,
     "learning_rate": 1e-5, # Probably a bit high, need to decrease
     "optimizer_type": "AdamW", # Added for tracking
     "scheduler_type": "NewBob", # Added for tracking
@@ -274,13 +270,13 @@ hparams = {
     "num_beams": 5,
 
     # === W&B Configuration ===
-    "use_wandb": True,  # Flag to enable/disable easily
-    "wandb_project": "Whisper-Egyptian-Finetune",  # Project name
-    "wandb_entity": None,  # Optional: Your W&B username or team name
+    "use_wandb": True,  # Flag to enable/disable weights and biases
+    "wandb_project": "you project's name on weights and biases ",  # Placeholder : Project name on weights and biases 
+    "wandb_entity": None,  # Placeholder - Optional: Your W&B username or team name
     "wandb_log_batch_freq": 100,  # Log batch metrics every N steps
     "wandb_watch_model": True,  # Whether to watch gradients
     "wandb_watch_freq": 100,  # How often to log gradients
-    "wandb_resume_id": None, # Set to a run ID string to resume a specific W & B run
+    "wandb_resume_id": None, # Set to specific run ID string to resume a  W & B run
 }
 
 # Add a check after hparams definition
@@ -293,7 +289,7 @@ print("Hyperparameters defined.")
 # End of Cell 2
 
 
-# Cell 3: Define Data Loading/Preprocessing (Unchanged from V3)
+# Cell 3: Define Data Loading/Preprocessing 
 
 import torch
 import torchaudio
@@ -336,39 +332,13 @@ def text_pipeline_minimal(text):
     """Provides the raw text string."""
     return str(text) if text is not None else ""
 
-# --- Manual Augmentation Functions (will be called inside Brain - unchanged) ---
-def _apply_pitch_shift(waveform, sr, prob, low, high):
-    if random.random() < prob:
-        n_steps = random.randint(low, high)
-        if n_steps != 0:
-            try:
-                result = torchaudio.functional.pitch_shift(waveform.cpu(), sr, n_steps=n_steps).to(waveform.device)
-                if not torch.all(torch.isfinite(result)):
-                    logging.warning("NaN/Inf detected after pitch shift. Using original waveform.")
-                    return waveform
-                return result
-            except Exception as e:
-                logging.warning(f"torchaudio pitch shift failed: {e}")
-    return waveform
 
-def _apply_gain(waveform, prob, low_db, high_db):
-    if random.random() < prob:
-        gain_db = random.uniform(low_db, high_db)
-        gain_amp = 10.0 ** (gain_db / 20.0) if gain_db > -float('inf') else 0.0
-        result = waveform * gain_amp
-        result = torch.clamp(result, min=-1.0, max=1.0)
-        
-        if not torch.all(torch.isfinite(result)):
-            logging.warning("NaN/Inf detected after gain adjustment. Using original waveform.")
-            return waveform
-        return result
-    return waveform
 
 print("Data Loading Pipelines defined.")
 # End of Cell 3
 
 
-# Cell 4: Define Brain Subclass (Modified Augmentation Initialization)
+# Cell 4: Define Brain Subclass 
 
 import speechbrain as sb
 from speechbrain.utils.metric_stats import ErrorRateStats
@@ -378,7 +348,7 @@ from speechbrain.augment.time_domain import (
     SpeedPerturb, AddNoise, AddReverb, DropChunk, DropFreq,
     DoClip, DropBitResolution
 )
-from speechbrain.augment.codec import CodecAugment # <--- ADD THIS IMPORT
+from speechbrain.augment.codec import CodecAugment 
 from speechbrain.augment.augmenter import Augmenter
 import os
 import string
@@ -390,7 +360,7 @@ import soundfile as sf # Needed for writing noise files
 import csv # Needed for writing noise manifest
 import torchaudio # Needed for resampling noise
 
-# --- Wrapper Augmentation Modules (placed before Brain class for visibility) ---
+# --- Wrapper Augmentation Modules ---
 
 # --- Wrapper for Manual Pitch Shift ---
 class PitchShiftWrapper(torch.nn.Module):
@@ -621,7 +591,7 @@ class WhisperFineTuneBrain(sb.Brain):
                     logging.warning(f"Could not create noise manifest or initialize AddNoise: {e_create_manifest}. Skipping AddNoise.", exc_info=True)
                     noise_manifest_path = None # Ensure path is None on error
 
-            # --- Initialize AddReverb using dynamically created manifest (NEW) ---
+            # --- Initialize AddReverb using dynamically created manifest  ---
             reverb_prob = getattr(self.hparams, "reverb_prob", 0.0)
             rir_assets_dir = getattr(self.hparams, "rir_assets_dir", "/rir_assets") # Get dir from hparams
             rir_manifest_path = getattr(self.hparams, "rir_manifest_path", os.path.join(self._temp_dir, "rir_manifest.csv")) # Get manifest path
@@ -686,7 +656,7 @@ class WhisperFineTuneBrain(sb.Brain):
                     speed_perturber = SpeedPerturb(
                         orig_freq=target_sr,
                         speeds=speeds,
-                        device=self.device  # Added device parameter
+                        device=self.device 
                     )
                     sb_augmentations.append(speed_perturber)
                     initialized_augmentations.append("SpeedPerturb")
@@ -746,30 +716,28 @@ class WhisperFineTuneBrain(sb.Brain):
                 except Exception as e:
                     logging.warning(f"Could not initialize GainWrapper: {e}. Skipping.", exc_info=True)
 
-            # --- Initialize DoClip (NEW) ---
+            # --- Initialize DoClip  ---
             if getattr(self.hparams, "use_do_clip", False):
                 try:
                     clipper = DoClip(
                         clip_low=self.hparams.clip_low,
                         clip_high=self.hparams.clip_high,
-                        # prob=clip_prob # REMOVED: DoClip doesn't take prob directly
                     )
                     sb_augmentations.append(clipper)
                     initialized_augmentations.append("DoClip")
                 except Exception as e:
                     logging.warning(f"Could not initialize DoClip: {e}. Skipping.", exc_info=True)
 
-            # --- Initialize DropBitResolution (REVISED) ---
+            # --- Initialize DropBitResolution  ---
             if getattr(self.hparams, "use_drop_bit_resolution", False):
                 try:
-                    # Initialize correctly with no args (uses default target_dtype='random')
                     bit_dropper = DropBitResolution()
                     sb_augmentations.append(bit_dropper)
                     initialized_augmentations.append("DropBitResolution")
                 except Exception as e:
                     logging.warning(f"Could not initialize DropBitResolution: {e}. Skipping.", exc_info=True)
 
-            # --- Initialize CodecAugment (Forcing g722) --- (NEW)
+            # --- Initialize CodecAugment (Forcing g722)
             if getattr(self.hparams, "use_codec_augment", False):
                 try:
                     codec_augmenter = CodecAugment(sample_rate=target_sr)
@@ -795,7 +763,7 @@ class WhisperFineTuneBrain(sb.Brain):
                         min_augmentations=getattr(self.hparams, "min_augmentations", 1),
                         max_augmentations=effective_max_augmentations,
                         shuffle_augmentations=True,
-                        augment_prob=getattr(self.hparams, "augment_prob_master", 0.50), # Use value from hparams
+                        augment_prob=getattr(self.hparams, "augment_prob_master", 0.50), 
                         augmentations=sb_augmentations,
                     )
                     aug_names = [type(aug).__name__ for aug in sb_augmentations]
@@ -879,12 +847,9 @@ class WhisperFineTuneBrain(sb.Brain):
                         wav_lens = signal_lens
                         applied_augs_list = [f"Error: {type(aug_e).__name__}"]
                         augmentation_applied_this_batch = False # Augmentation failed
-                # else: # Optional: Log if probability check failed
-                #    logging.debug(f"Skipped augmentation this batch due to augment_prob: {self.augmenter.augment_prob}")
 
-            # --- Log applied augmentations (if any) --- 
-            # This logs the list captured *before* the augmenter was called, reflecting the *intended* selection
-            # Log level can be adjusted (e.g., INFO if you want it more prominent)
+            # --- Log applied augmentations --- 
+            # Log level can be adjusted (e.g., INFO more higher verbosity)
             logging.debug(f"Batch Augmentations Applied (Predicted): {applied_augs_list if augmentation_applied_this_batch else 'None'}")
 
             try:
@@ -1014,18 +979,6 @@ class WhisperFineTuneBrain(sb.Brain):
                  return torch.tensor(0.0, device=self.device, requires_grad=False)
 
             ids = getattr(batch, 'id', [f'no_id_{i}' for i in range(log_probs.shape[0])])
-
-            # --- Targets are now directly available from predictions --- 
-            # try:
-            #      _, _, _, tokens_eos_data, tokens_data, target_words_raw = self._preprocess_batch(batch, stage)
-            #      if tokens_eos_data is None or tokens_eos_data[0] is None:
-            #           logging.error("Failed to retrieve targets from preprocessing.")
-            #           return torch.tensor(0.0, device=self.device, requires_grad=False)
-            #      tokens_eos_padded, tokens_eos_lens_rel = tokens_eos_data
-            #      tokens_padded, tokens_lens_rel = tokens_data
-            # except Exception as e:
-            #      logging.error(f"Error retrieving targets in compute_objectives: {e}")
-            #      return torch.tensor(0.0, device=self.device, requires_grad=False)
             
             # Directly unpack target tokens from predictions
             if tokens_eos_data is None or tokens_eos_data[0] is None:
@@ -1108,7 +1061,7 @@ class WhisperFineTuneBrain(sb.Brain):
         except Exception as e: 
             logging.error(f"Error initializing metrics for stage {stage}: {e}")
 
-    # --- on_stage_end (Summarize from SEPARATE objects) ---
+    # --- on_stage_end  ---
     def on_stage_end(self, stage, stage_loss, epoch):
         stage_stats = {}
         try:
@@ -1163,7 +1116,7 @@ class WhisperFineTuneBrain(sb.Brain):
                             test_stats=stage_stats
                         )
 
-                # --- RE-ADD Manual W&B logging for epoch stats ---
+                # --- Manual W&B logging for epoch stats ---
                 if getattr(self.hparams, "use_wandb", False):
                     try:
                         import wandb
@@ -1210,7 +1163,7 @@ class WhisperFineTuneBrain(sb.Brain):
                     except Exception as e:
                         logging.error(f"Error logging {stage_key_prefix} stats to WandB: {e}")
 
-                # --- Checkpointing (Only on VALID stage) ---
+                # --- Checkpointing (on VALID stage) ---
                 if stage == sb.Stage.VALID:
                     num_to_keep = getattr(self.hparams, "num_checkpoints_to_keep", 1)
                     if wer is not None and math.isfinite(wer) and hasattr(self, 'checkpointer') and self.checkpointer:
@@ -1236,7 +1189,6 @@ class WhisperFineTuneBrain(sb.Brain):
 
         return stage_stats
 
-    # --- on_fit_start (Updated with temporary variable) ---
     def on_fit_start(self):
         try:
             super().on_fit_start()
@@ -1344,18 +1296,10 @@ class WhisperFineTuneBrain(sb.Brain):
                             "train/learning_rate": self.optimizer.param_groups[0]['lr'],
                             "trainer/global_step": self.step,
                             "trainer/should_step": int(should_step),
-                        }
-                        # REMOVE logging the parameter name string
-                        # if max_norm_name:
-                        #     wandb_step_metrics["train/max_grad_param"] = max_norm_name
-                        
+                        }         
                         # Only log finite numerical values
                         wandb.log({k: v for k, v in wandb_step_metrics.items() if isinstance(v, (int, float)) and math.isfinite(v)})
-                        
-                        # REMOVE separate string logging
-                        # str_metrics = {k: v for k, v in wandb_step_metrics.items() if isinstance(v, str)}
-                        # if str_metrics:
-                        #     wandb.log(str_metrics)
+
                             
                 except Exception as wandb_log_e:
                     logging.warning(f"Could not log step metrics to W&B: {wandb_log_e}")
@@ -1369,7 +1313,7 @@ class WhisperFineTuneBrain(sb.Brain):
 
         return loss.cpu() if isinstance(loss, torch.Tensor) else torch.tensor(loss)
 
-    # --- on_train_epoch_end (WITH FILE DEBUGGING) ---
+
     def on_train_epoch_end(self, epoch):
         # Define a debug file path (use /tmp which is usually writable)
         debug_file_path = f"/tmp/epoch_{epoch}_debug.txt"
@@ -1402,16 +1346,16 @@ class WhisperFineTuneBrain(sb.Brain):
             # --- Original logic ---
             if not self._train_loss_buffer:
                 self.avg_train_loss = 0.0
-                logging.info(f"Epoch {epoch} ended. Assigning avg_train_loss = 0.0 because buffer was empty.") # Keep INFO log
+                logging.info(f"Epoch {epoch} ended. Assigning avg_train_loss = 0.0 because buffer was empty.") 
             else:
                 # Assign the average
                 try:
                     buffer_len = len(self._train_loss_buffer)
                     if buffer_len > 0:
                         self.avg_train_loss = sum(self._train_loss_buffer) / buffer_len
-                        logging.info(f"Epoch {epoch} ended. Assigning Average train loss: {self.avg_train_loss:.4f}") # Keep INFO log
+                        logging.info(f"Epoch {epoch} ended. Assigning Average train loss: {self.avg_train_loss:.4f}") 
                     else:
-                        logging.warning(f"Epoch {epoch}: Reached 'else' block but buffer length is {buffer_len}. Assigning 0.0.") # Keep WARN log
+                        logging.warning(f"Epoch {epoch}: Reached 'else' block but buffer length is {buffer_len}. Assigning 0.0.") 
                         self.avg_train_loss = 0.0
                 except Exception as assign_e:
                      logging.error(f"Epoch {epoch}: Error calculating/assigning avg_train_loss in 'else' block: {assign_e}. Assigning 0.0.", exc_info=True) # Keep ERROR log
@@ -1479,17 +1423,17 @@ logging.info("Defining Modal training function...")
 
 @app.function(
     image=modal_image,
-    gpu="A100-80GB", 
+    gpu="A100-40GB",  # Change this in case you want to use a different GPU
     cpu=8,
     volumes={CHECKPOINT_DIR: volume},
     secrets=[hf_secret, wandb_secret],
     timeout=7200
 )
 def train_whisper_on_modal():
-    global hparams # Keep global for now, though passing explicitly might be cleaner
-    wandb_run = None # Initialize wandb_run variable
+    global hparams 
+    wandb_run = None 
 
-    # === Robust W&B Initialization (Manual Approach) ===
+    # === Robust W&B Initialization ===
     if hparams.get("use_wandb", False):
         logging.info("Attempting W&B Initialization...")
         try:
@@ -1500,17 +1444,15 @@ def train_whisper_on_modal():
             wandb_api_key = os.environ.get("WANDB_API_KEY")
             if wandb_api_key:
                 logging.info("WANDB_API_KEY environment variable found.")
-                # Optionally log first few/last few chars for verification, but be careful!
-                # logging.info(f"WANDB_API_KEY starts with: {wandb_api_key[:4]}") 
             else:
                  logging.warning("WANDB_API_KEY environment variable NOT found. W&B initialization might fail.")
 
             # Use standard string formatting to avoid f-string quote issues
-            project_name = getattr(hparams, "wandb_project", "speechbrain-default")
+            project_name = getattr(hparams, "wandb_project", "project-name") # Placeholder : Change this to your project's name on weights and biases
             entity_name = hparams.get("wandb_entity", None) # Use .get()
             resume_id = hparams.get("wandb_resume_id", None) # Get the resume ID
 
-            # === Conditional W&B Init ===
+            # === Conditional W&B Init for resuming runs===
             if resume_id:
                 logging.info(f"Attempting to resume W&B run with ID: {resume_id}")
                 wandb_run = wandb.init(
@@ -1520,7 +1462,6 @@ def train_whisper_on_modal():
                     resume="must",       # Ensure it resumes or fails
                     config=hparams,        # Still log config for reference
                     job_type="train",
-                    # Note: name is omitted, W&B uses the existing run's name
                 )
             else:
                 logging.info("Starting a new W&B run.")
@@ -1557,8 +1498,6 @@ def train_whisper_on_modal():
         logging.info("=== Starting train_whisper_on_modal function ===")
         logging.info("Python version: %s", sys.version)
         logging.info("Current working directory: %s", os.getcwd())
-        # Avoid logging all env vars, can be too verbose and contain sensitive info
-        # logging.info("Environment variables: %s", str(dict(os.environ)))
 
         logging.info("Importing required libraries for training...")
         try:
@@ -1831,10 +1770,9 @@ def train_whisper_on_modal():
         # Check if wandb_run exists (meaning wandb.init was successful)
         if wandb_run and hparams.get("wandb_watch_model", False):
              try:
-                 # Ensure wandb is available
                  import wandb 
                  # Use .get() for watch frequency too
-                 watch_freq = hparams.get("wandb_watch_freq", 100)
+                 watch_freq = hparams.get("wandb_watch_freq", 100) # Placeholder : Change this to your desired watch frequency
                  # Watch the specific model module within the Brain class
                  wandb.watch(whisper_brain.modules.whisper, log="gradients", log_freq=watch_freq)
                  logging.info(f"WandB watching model gradients every {watch_freq} steps.")
@@ -1843,12 +1781,9 @@ def train_whisper_on_modal():
              except Exception as e:
                  logging.warning(f"Could not set up wandb.watch: {e}")
         else:
-             # Log why watch wasn't enabled
              missing_watch_reasons = []
              if not wandb_run: missing_watch_reasons.append("W&B run not initialized")
-             # Use .get() for the check here too
              if not hparams.get("wandb_watch_model", False): missing_watch_reasons.append("W&B watch disabled in hparams")
-             # No need to check brain or logger type here if W&B isn't active
              if missing_watch_reasons: logging.info(f"Skipping wandb.watch because: {', '.join(missing_watch_reasons)}")
 
         # --- Training ---
@@ -1906,7 +1841,7 @@ def train_whisper_on_modal():
         logging.error(f"Main training function failed: {main_e}", exc_info=True)
     finally:
         # --- Robust W&B Finish --- 
-        if wandb_run: # Only finish if init was successful and wandb_run is assigned
+        if wandb_run: 
             try:
                 logging.info(f"Finishing W&B run: {wandb_run.name}")
                 wandb.finish()
@@ -1916,7 +1851,6 @@ def train_whisper_on_modal():
             logging.info("W&B run was not active, skipping wandb.finish().")
 
         # --- Commit Volume --- 
-        # This should happen regardless of W&B status
         try:
             volume.commit()
             logging.info("Final volume commit attempt in finally block.")
