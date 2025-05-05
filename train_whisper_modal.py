@@ -1427,7 +1427,8 @@ logging.info("Defining Modal training function...")
     cpu=8,
     volumes={CHECKPOINT_DIR: volume},
     secrets=[hf_secret, wandb_secret],
-    timeout=7200
+    timeout=6 * 60 * 60,
+    container_idle_timeout=30*60
 )
 def train_whisper_on_modal():
     global hparams 
