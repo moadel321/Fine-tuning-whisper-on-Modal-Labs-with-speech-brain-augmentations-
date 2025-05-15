@@ -36,7 +36,7 @@ logging.info("Configuring logging system...")
 
 # --- Verify Whisper Token IDs ---
 logging.info("Defining verify_whisper_tokens function...")
-def verify_whisper_tokens(model_name="openai/whisper-small", language="ar", task="transcribe"):
+def verify_whisper_tokens(model_name="openai/whisper-large-v3-turbo", language="ar", task="transcribe"): # Placeholder : Change this if you want to use a different whisper model
     logging.info(f"Verifying Whisper tokens for model {model_name}")
     try:
         # Use WhisperProcessor to load both tokenizer and feature extractor
@@ -84,7 +84,7 @@ def verify_whisper_tokens(model_name="openai/whisper-small", language="ar", task
 print("Defining Modal App basics...")
 
 # --- Modal App Setup ---
-app = modal.App("name-of-your-app") # Placeholder : name your modal app here 
+app = modal.App("fine-tune-whisper-large-egyptian-arabic") # Placeholder : name your modal app here 
 
 # --- Secrets ---
 hf_secret = modal.Secret.from_name("huggingface-secret-write") # Define the huggingface secret object
@@ -92,7 +92,7 @@ wandb_secret = modal.Secret.from_name("wandb-secret") # Define the wandb secret 
 
 # --- Persistent Storage ---
 volume = modal.Volume.from_name(
-    "name-of-your-volume", create_if_missing=True # Placeholder : name your volume here 
+    "fine-tune-whisper-large-egyptian-arabic", create_if_missing=True # Placeholder : name your volume here 
 )
 CACHE_DIR = "/cache" # HF cache inside container
 CHECKPOINT_DIR = "/root/checkpoints" # Mount point inside container
@@ -129,7 +129,9 @@ modal_image = (
         "pyyaml==6.0.1",
         "tqdm==4.66.1",
         "pandas==2.1.4",
-        "soundfile==0.12.1"
+        "soundfile==0.12.1",
+        "flash-attn==2.4.2",          # fused attention kernels
+        "bitsandbytes==0.45.4",   
     )
     # Download noise & RIR WAVs during image build, you will want to change this to increase the number of files 
     .run_commands(
@@ -162,22 +164,22 @@ os.environ["HF_HUB_CACHE"] = CACHE_DIR
 print("Defining Hyperparameters...")
 
 # Verify token IDs first
-token_info = verify_whisper_tokens(model_name="openai/whisper-small", language="ar", task="transcribe")
+token_info = verify_whisper_tokens(model_name="openai/whisper-large-v3-turbo", language="ar", task="transcribe") #Placeholder : Change this if you want to use a different whisper model
 
 TARGET_SAMPLE_RATE = 16000 # Define target sample rate globally
 
 hparams = {
     # Data
-    "hf_dataset_id": "huggingfaceusername/datasetname", # Placeholder : Change this if you want to use a different dataset
+    "hf_dataset_id": "MAdel121/arabic-egy-cleaned", # Placeholder : Change this if you want to use a different dataset
     "train_split": "train",
     "valid_split": "validation",
     "test_split": "test",
     "target_sample_rate": TARGET_SAMPLE_RATE,
 
     # Model & Tokenizer
-    "whisper_hub": "openai/whisper-small", # Placeholder : Change this if you want to use a different whisper model
-    "save_folder": f"{CHECKPOINT_DIR}/whisper_small_egy_save",
-    "output_folder": f"{CHECKPOINT_DIR}/whisper_small_egy_output",
+    "whisper_hub": "openai/whisper-large-v3-turbo", # Placeholder : Change this if you want to use a different whisper model
+    "save_folder": f"{CHECKPOINT_DIR}/whisper_large_egy_save",
+    "output_folder": f"{CHECKPOINT_DIR}/whisper_large_egy_output",
     "language": "ar",
     "task": "transcribe",
 
@@ -256,7 +258,7 @@ hparams = {
     "lr_annealing_factor": 0.9, # Used by NewBobScheduler
     "batch_size_dynamic": False, # DISABLED DYNAMIC BATCHING
     "dynamic_batch_num_buckets": 60, # (Not used when dynamic batching is False)
-    "loader_batch_size": 8, # Used only if batch_size_dynamic is False
+    "loader_batch_size": 12, # Used only if batch_size_dynamic is False
     "max_batch_len_seconds": 40.0,
     "num_workers": 8,
     "grad_accumulation_factor": 2,
@@ -270,8 +272,8 @@ hparams = {
     "num_beams": 5,
 
     # === W&B Configuration ===
-    "use_wandb": True,  # Flag to enable/disable weights and biases
-    "wandb_project": "you project's name on weights and biases ",  # Placeholder : Project name on weights and biases 
+    "use_wandb": False,  # Flag to enable/disable weights and biases
+    "wandb_project": "whisper-large-egyptian-arabic",  # Placeholder : Project name on weights and biases 
     "wandb_entity": None,  # Placeholder - Optional: Your W&B username or team name
     "wandb_log_batch_freq": 100,  # Log batch metrics every N steps
     "wandb_watch_model": True,  # Whether to watch gradients
@@ -1423,11 +1425,12 @@ logging.info("Defining Modal training function...")
 
 @app.function(
     image=modal_image,
-    gpu="A100-40GB",  # Change this in case you want to use a different GPU
+    gpu="A100-80GB",  # Change this in case you want to use a different GPU
     cpu=8,
     volumes={CHECKPOINT_DIR: volume},
     secrets=[hf_secret, wandb_secret],
-    timeout=7200
+    timeout=6 * 60 * 60,
+    scaledown_window=30*60
 )
 def train_whisper_on_modal():
     global hparams 
@@ -1448,7 +1451,7 @@ def train_whisper_on_modal():
                  logging.warning("WANDB_API_KEY environment variable NOT found. W&B initialization might fail.")
 
             # Use standard string formatting to avoid f-string quote issues
-            project_name = getattr(hparams, "wandb_project", "project-name") # Placeholder : Change this to your project's name on weights and biases
+            project_name = getattr(hparams, "wandb_project", "whisper-medium-egyptian-arabic") # Placeholder : Change this to your project's name on weights and biases
             entity_name = hparams.get("wandb_entity", None) # Use .get()
             resume_id = hparams.get("wandb_resume_id", None) # Get the resume ID
 
