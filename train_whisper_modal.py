@@ -921,61 +921,32 @@ class WhisperFineTuneBrain(sb.Brain):
             tokens_eos = (tokens_eos_padded, tokens_eos_lens_rel)
             tokens = (tokens_padded, tokens_lens_rel) # For metrics reference
 
-            # Process audio wavs with feature_extractor
-            # Ensure wavs are on CPU if feature_extractor requires numpy (typical for some versions)
-            # Modern HF feature extractors can handle tensors. For safety and broader compatibility:
-            # Convert BFloat16/Float16 to Float32 before converting to numpy.... I tried to make HF Extractor handle tensors directly but it failed.... we'll see later on... room for imporvement here 
-            list_of_wav_arrays = [wav.cpu().float().numpy() for wav in torch.unbind(wavs, dim=0)]
+            # The input `wavs` (which is `signals` from `batch.signal_raw`) should now be the batched [B, T] tensor.
+            # We no longer convert it to a list of numpy arrays.
+            raw_audio_waveforms = wavs # Assuming wavs is the [B, T] tensor from PaddedBatch
             
             if self.feature_extractor is None:
                 raise ValueError("Feature extractor is not initialized. Make sure processor was properly set.")
                 
             try:
                 # Process the audio with these settings
-                processed_audio = self.feature_extractor(
-                    list_of_wav_arrays,
-                    sampling_rate=hparams["target_sample_rate"], # This should be 16000 for Whisper Models 
-                    return_tensors="pt",
-                    padding="max_length",  # Ensure padding to max length
-                    truncation=True,        # Truncate if longer
-                    return_attention_mask=True 
-                )
+                with torch.no_grad(): # Extractor is non-learnable
+                    processed_audio = self.feature_extractor(
+                        raw_audio_waveforms, # Pass the batched tensor directly
+                        sampling_rate=hparams["target_sample_rate"], 
+                        return_tensors="pt",
+                        padding="max_length",  # Pad features to 30s (3000 frames)
+                        truncation=True,
+                        return_attention_mask=True # Ensure mask is returned
+                    )
                 
-                # Verify the shape of the processed features matches what Whisper expects
-                expected_shape = (128, 3000)
-                if processed_audio.input_features.shape[1:] != expected_shape:
-                    logging.warning(f"Feature extractor returned unexpected shape: {processed_audio.input_features.shape}, reshaping to [B, 128, 3000]")
-                    B = processed_audio.input_features.shape[0]
-                    
-                    # Create correctly shaped tensor and fill with available data
-                    correct_features = torch.zeros((B, 128, 3000), device=processed_audio.input_features.device)
-                    
-                    # If feature dimensions are wrong, we need to handle this specially
-                    if processed_audio.input_features.shape[1] != 128:
-                        # Take the first 128 features or pad if fewer
-                        src_features = min(128, processed_audio.input_features.shape[1])
-                        correct_features[:, :src_features, :min(3000, processed_audio.input_features.shape[2])] = \
-                            processed_audio.input_features[:, :src_features, :min(3000, processed_audio.input_features.shape[2])]
-                    else:
-                        # Just handle time dimension
-                        correct_features[:, :, :min(3000, processed_audio.input_features.shape[2])] = \
-                            processed_audio.input_features[:, :, :min(3000, processed_audio.input_features.shape[2])]
-                    
-                    processed_audio.input_features = correct_features
-                    
-                    # Also ensure attention mask is correct length if it exists
-                    if hasattr(processed_audio, "attention_mask"):
-                        att_mask = processed_audio.attention_mask
-                        correct_mask = torch.ones((B, 3000), dtype=att_mask.dtype, device=att_mask.device)
-                        if att_mask.shape[1] < 3000:
-                            correct_mask[:, :att_mask.shape[1]] = att_mask
-                        else:
-                            correct_mask = att_mask[:, :3000]
-                        processed_audio.attention_mask = correct_mask
+                assert processed_audio.input_features.shape[2] == 3000, \
+                    f"Feature extractor output unexpected time dimension: {processed_audio.input_features.shape[2]}"
+
             except Exception as proc_e:
                 logging.error(f"Error during feature extraction: {proc_e}. Will attempt to continue.", exc_info=True)
                 # Try to recover with a minimal processed_audio object if extraction fails
-                B = len(list_of_wav_arrays)
+                B = len(raw_audio_waveforms)
                 processed_audio = type('', (), {})()  # Create an empty object
                 processed_audio.input_features = torch.zeros((B, 128, 3000), device=self.device)  # [B, 128, 3000] - standard Whisper mel features
                 processed_audio.attention_mask = torch.ones((B, 3000), device=self.device)  # [B, 3000]
@@ -1572,11 +1543,12 @@ logging.info("Defining Modal training function...")
 
 @app.function(
     image=modal_image,
+    concurrency_limit=1,
     gpu="A100-80GB",  # Change this in case you want to use a different GPU
     cpu=8,
     volumes={CHECKPOINT_DIR: volume},
     secrets=[hf_secret, wandb_secret],
-    timeout=6 * 60 * 60,
+    timeout=15 * 60 * 60,
     scaledown_window=30*60
 )
 def train_whisper_on_modal():
@@ -1598,7 +1570,7 @@ def train_whisper_on_modal():
                  logging.warning("WANDB_API_KEY environment variable NOT found. W&B initialization might fail.")
 
             # Use standard string formatting to avoid f-string quote issues
-            project_name = getattr(hparams, "wandb_project", "whisper-medium-egyptian-arabic") # Placeholder : Change this to your project's name on weights and biases
+            project_name = getattr(hparams, "wandb_project", "whisper-large-v3-turbo-egyptian-arabic") # Placeholder : Change this to your project's name on weights and biases
             entity_name = hparams.get("wandb_entity", None) # Use .get()
             resume_id = hparams.get("wandb_resume_id", None) # Get the resume ID
 
@@ -1768,6 +1740,7 @@ def train_whisper_on_modal():
                 hparams.get("whisper_hub"),
                 cache_dir=CACHE_DIR # Use persistent cache
             )
+            processor.feature_extractor.return_attention_mask = True # Good default
             
             # Configuration of n_fft, hop_length, n_mels removed to use defaults from pretrained model
             logging.info(f"Using default feature extractor configuration from {hparams.get('whisper_hub')}")
@@ -1782,7 +1755,10 @@ def train_whisper_on_modal():
                 cache_dir=CACHE_DIR                  # Use persistent cache
             )
             
-            # Move model to GPU immediately to ensure Flash Attention initializes correctly
+            whisper_model.gradient_checkpointing_enable()  # Enable before moving to GPU
+            whisper_model.config.use_cache = False         # Mandatory for gradient checkpointing
+
+            # Move model to GPU after gradient checkpointing setup
             whisper_model = whisper_model.to("cuda")
             
             # Only put the whisper_model in modules - processor is NOT a torch.nn.Module!
