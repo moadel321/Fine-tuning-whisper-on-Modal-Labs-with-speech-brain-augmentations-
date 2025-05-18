@@ -1,30 +1,13 @@
 import logging
+import datetime
+import yaml  # Add yaml import
 import tempfile  # Add tempfile for safe temporary file handling
 import csv  # Add csv import for augmentation file handling
 import shutil  # For cleanup
 import math
 import torch.nn.functional as F
 from speechbrain.processing.signal_processing import  reverberate
-from transformers import get_linear_schedule_with_warmup  # Import for linear LR scheduler
-
-# Helper function for safer hparams access
-def safe_hparams_get(hparams, key, default=None):
-    """
-    Safely get a parameter value from hparams, whether it's a dict or SimpleNamespace.
-    
-    Args:
-        hparams: Can be a dict or a SimpleNamespace
-        key: The parameter name to get
-        default: Default value if parameter doesn't exist
-        
-    Returns:
-        The parameter value or the default
-    """
-    if hasattr(hparams, key):  # For SimpleNamespace
-        return getattr(hparams, key)
-    elif isinstance(hparams, dict) and key in hparams:  # For dict
-        return hparams[key]
-    return default
+from datasets import load_dataset  # Global import for dataset loading in Brain
 
 # Turn off tokenizers parallelism warnings
 import os
@@ -115,44 +98,49 @@ CACHE_DIR = "/cache" # HF cache inside container
 CHECKPOINT_DIR = "/root/checkpoints" # Mount point inside container
 
 # --- Environment Image Definition ---
+# Use a CUDA development image as a base for flash-attn compilation
 modal_image = (
-    # Use Modal's pre-built CUDA image which has CUDA toolkit properly installed
-    modal.Image.from_registry(
-        "nvidia/cuda:12.1.0-devel-ubuntu22.04", 
-        add_python="3.10"
-    )
-    # Install system dependencies
+    modal.Image.from_registry("nvidia/cuda:12.1.1-devel-ubuntu22.04", add_python="3.10")
+    .env({"CUDA_LAUNCH_BLOCKING": "1"}) 
     .apt_install(
         "build-essential", "cmake", "libboost-all-dev",
         "libeigen3-dev", "git", "libsndfile1", "ffmpeg",
-        "wget", "ninja-build", # Ninja is useful for faster compilation
+        "wget" 
     )
-    # First install core Python tools and PyTorch
-    .run_commands(
-        # Install pip and core packages
-        "python -m pip install --no-cache-dir --upgrade pip==23.3.2 setuptools==69.0.3 wheel==0.42.0",
-        # Install PyTorch with CUDA support
-        "python -m pip install --no-cache-dir torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu121",
-        # Install flash-attn separately with options
-        "python -m pip install --no-cache-dir flash-attn==2.4.2 --no-build-isolation",
+    .pip_install(  # First install torch, torchaudio, torchvision - these are pre-compiled usually
+        "torch==2.3.1",
+        "torchaudio==2.3.1",
+        "torchvision==0.18.1"
     )
-    # Now install remaining packages
-    .pip_install(
-        "bitsandbytes==0.45.4",
-        "transformers==4.51.3",
-        "accelerate==0.25.0",
-        "wandb",
-        "speechbrain==1.0.3",
-        "librosa==0.10.1",
-        "datasets==2.16.1",
-        "huggingface_hub==0.30.0",
-        "sentencepiece==0.1.99",
-        "num2words==0.5.13",
-        "pyyaml==6.0.1",
-        "tqdm==4.66.1",
-        "pandas==2.1.4",
-        "soundfile==0.12.1",
-        "pyarrow==15.0.0",
+    .pip_install(  # Then install the rest of the packages
+                  # For flash-attn and bitsandbytes, specify gpu to ensure CUDA toolkit is available for compilation
+        [
+            "pip==23.3.2",
+            "setuptools==69.0.3",
+            "wheel==0.42.0",
+            "pyarrow==15.0.0",
+            "transformers==4.51.3",
+            "accelerate==0.32.1",
+            "wandb",
+            "speechbrain==1.0.3",
+            "librosa==0.10.1",
+            "datasets==2.16.1",
+            "huggingface_hub==0.30.0",
+            "sentencepiece==0.1.99",
+            "num2words==0.5.13",
+            "pyyaml==6.0.1",
+            "tqdm==4.66.1",
+            "pandas==2.1.4",
+            "soundfile==0.12.1",
+        ]
+    )
+    .pip_install( # Install flash-attn separately with GPU context for compilation
+        "flash-attn==2.5.8",
+        gpu="A100" # Or any compatible GPU type, A100 is what the function uses
+    )
+    .pip_install( # Install bitsandbytes separately with GPU context for compilation
+        "bitsandbytes==0.43.1",
+        gpu="A100"
     )
     # Download noise & RIR WAVs during image build, you will want to change this to increase the number of files 
     .run_commands(
@@ -167,7 +155,7 @@ modal_image = (
 
 print("Modal App basics defined (using modal.Volume.from_name).")
 # End of Cell 1
-
+ 
 # Ensure persistent Hugging Face cache inside the volume
 CHECKPOINT_DIR = "/root/checkpoints"  # Mount point inside container (defined above)
 CACHE_DIR = f"{CHECKPOINT_DIR}/hf_cache"  # Persistent HF cache stored in Modal volume
@@ -270,17 +258,17 @@ hparams = {
     "seed": 1986,
     "epochs": 10,
     "learning_rate": 1e-5, # Probably a bit high, need to decrease
-    "optimizer_type": "AdamW8bit", # Added for tracking
+    "optimizer_type": "AdamW", # Added for tracking
     "scheduler_type": "NewBob", # Added for tracking
     "lr_improvement_threshold": 0.0025, # Default for NewBobScheduler 
     "lr_patient": 0, # Default for NewBobScheduler 
-    "lr_warmup_steps": 500,
+    "lr_warmup_steps": 1000,
     "weight_decay": 0.05,
     "lr_annealing_factor": 0.9, # Used by NewBobScheduler
-    "batch_size_dynamic": False, # DISABLED DYNAMIC BATCHING
-    "dynamic_batch_num_buckets": 60, # (Not used when dynamic batching is False)
+    "batch_size_dynamic": True, # ENABLED DYNAMIC BATCHING 
+    "dynamic_batch_num_buckets": 60, # 
     "loader_batch_size": 12, # Used only if batch_size_dynamic is False
-    "max_batch_len_seconds": 40.0,
+    "max_batch_len_seconds": 80.0,
     "num_workers": 8,
     "grad_accumulation_factor": 2,
     "max_grad_norm": 5.0,
@@ -288,10 +276,6 @@ hparams = {
     # Checkpointing
     "ckpt_interval_minutes": 30,
     "num_checkpoints_to_keep": 2,
-    
-    # AMP Params
-    "auto_mix_precision": True,
-    "amp_dtype": "float16", # Changed from bfloat16 to float16 for better compatibility
 
     # Whisper decoding params
     "num_beams": 5,
@@ -367,7 +351,9 @@ print("Data Loading Pipelines defined.")
 
 # Cell 4: Define Brain Subclass 
 
+import speechbrain as sb
 from speechbrain.utils.metric_stats import ErrorRateStats
+from speechbrain.dataio.batch import PaddedBatch
 # Consolidated imports
 from speechbrain.augment.time_domain import (
     SpeedPerturb, AddNoise, AddReverb, DropChunk, DropFreq,
@@ -376,8 +362,14 @@ from speechbrain.augment.time_domain import (
 from speechbrain.augment.codec import CodecAugment 
 from speechbrain.augment.augmenter import Augmenter
 import os
+import string
+import torch
 import torch.nn.utils.rnn as rnn_utils
-from torch.cuda.amp import GradScaler 
+import math
+import uuid # Needed for noise file naming
+import soundfile as sf # Needed for writing noise files
+import csv # Needed for writing noise manifest
+import torchaudio # Needed for resampling noise
 
 # --- Wrapper Augmentation Modules ---
 
@@ -500,21 +492,14 @@ class WhisperFineTuneBrain(sb.Brain):
             raise TypeError(f"Expected hparams to be a dict or namespace-like, but got {type(hparams)}")
 
         super().__init__(modules, opt_class, hparams, run_opts, checkpointer)
-        self._train_loss_buffer = []
-        # Add a get method to self.hparams if it's a SimpleNamespace
-        if hasattr(self.hparams, '__dict__') and not hasattr(self.hparams, 'get'):
-            # Add a get method to SimpleNamespace
-            self.hparams.get = lambda key, default=None: safe_hparams_get(self.hparams, key, default)
         
         try:
-            self.tokenizer = None  # Will be set after Brain initialization
-            self.feature_extractor = None  # Will be set after Brain initialization
-
+            self.tokenizer = self.modules.whisper.tokenizer
             # Access hparams using getattr for safety after super init
             self.sot_index = getattr(self.hparams, "sot_index", 50258)  # Start of transcript token
             self.eos_index = getattr(self.hparams, "eos_index", 50257)  # End of text token
-            self.pad_token_id = getattr(self.hparams, "pad_token_id", None)  # Will be set when tokenizer is available
-            self.decoder_start_ids = getattr(self.hparams, "decoder_start_ids", None)  # Will be set when tokenizer is available
+            self.pad_token_id = getattr(self.hparams, "pad_token_id", self.tokenizer.pad_token_id)
+            self.decoder_start_ids = getattr(self.hparams, "decoder_start_ids", [self.sot_index])
             
             # Verify token IDs match tokenizer
             if self.tokenizer:
@@ -607,9 +592,9 @@ class WhisperFineTuneBrain(sb.Brain):
                             )
                             sb_augmentations.append(noise_adder)
                             initialized_augmentations.append("AddNoise")
-                            logging.info("Successfully initialized AddNoise with dynamically created manifest (using full paths).")
+                            logging.info(f"Successfully initialized AddNoise with dynamically created manifest (using full paths).")
                         else:
-                             logging.warning("Dynamically created noise manifest is empty or header-only. Skipping AddNoise initialization.")
+                             logging.warning(f"Dynamically created noise manifest is empty or header-only. Skipping AddNoise initialization.")
                              noise_manifest_path = None # Invalidate the path
 
 
@@ -771,7 +756,7 @@ class WhisperFineTuneBrain(sb.Brain):
                     codec_augmenter.available_format_encoders = [("g722", None)]
                     sb_augmentations.append(codec_augmenter)
                     initialized_augmentations.append("CodecAugment (g722 forced)")
-                    logging.info("Initialized CodecAugment and forced g722 codec.")
+                    logging.info(f"Initialized CodecAugment and forced g722 codec.")
                 except Exception as e:
                     logging.warning(f"Could not initialize CodecAugment: {e}. Skipping.", exc_info=True)
 
@@ -811,434 +796,321 @@ class WhisperFineTuneBrain(sb.Brain):
         except Exception as e:
             logging.warning(f"Error cleaning up temporary files: {e}")
 
-# Inside the WhisperFineTuneBrain class
-
     # --- _preprocess_batch (Apply Augmenter Batch-wise) ---
     def _preprocess_batch(self, batch, stage):
-        """Applies augmentations, then concatenates clips to ~30s, then tokenization."""
+        """Applies augmentations and tokenization to the raw batch data."""
         try:
             batch = batch.to(self.device)
-            original_signals_tensor, original_signal_lens_rel = batch.signal_raw
-            original_ids = batch.id
-            original_texts = batch.text_raw # Keep original texts for tokenization later
-            if not isinstance(original_texts, list):
-                 original_texts = [str(t) for t in original_texts] if hasattr(original_texts, '__iter__') else [str(original_texts)]
+            if not isinstance(batch.signal_raw, (list, tuple)) or len(batch.signal_raw) != 2:
+                 logging.error(f"Unexpected batch.signal_raw format: {type(batch.signal_raw)}")
+                 raise ValueError("Invalid batch.signal_raw format")
 
-            wavs_for_augmentation = original_signals_tensor
-            wav_lens_for_augmentation = original_signal_lens_rel
-            
-            wavs_after_augmentation = original_signals_tensor
-            wav_lens_after_augmentation = original_signal_lens_rel
-            
-            applied_augs_list = [] 
-            augmentation_applied_this_batch = False
+            # Get original signals and lengths (relative)
+            signals, signal_lens = batch.signal_raw
+            ids = getattr(batch, 'id', [f'no_id_{i}' for i in range(signals.shape[0])])
+            texts = batch.text_raw # Keep original texts for tokenization later
+            if not isinstance(texts, list):
+                 texts = [str(t) for t in texts] if hasattr(texts, '__iter__') else [str(texts)]
 
-            if stage == sb.Stage.TRAIN and safe_hparams_get(self.hparams, "augment", False) and self.augmenter is not None:
-                if random.random() < self.augmenter.augment_prob: 
+            wavs = signals  # Start with original signals
+            wav_lens = signal_lens # Start with original relative lengths
+            applied_augs_list = [] # List to store names of applied augmentations for logging
+            augmentation_applied_this_batch = False # Flag to track if augmentation happened
+
+            # ***** Apply SpeechBrain Augmenter to the whole batch *****
+            if stage == sb.Stage.TRAIN and getattr(self.hparams, "augment", False) and self.augmenter is not None:
+                # Check probability BEFORE calling augmenter
+                if random.random() < self.augmenter.augment_prob:
                     try:
+                        # --- Replicate selection logic for logging --- 
                         min_aug = max(0, self.augmenter.min_augmentations)
                         max_aug = max(min_aug, self.augmenter.max_augmentations)
                         num_available_augs = len(self.augmenter.augmentations)
                         
-                        selected_augmentations_for_log = []
-                        N_augment_predicted = 0
+                        selected_augmentations_for_log = [] # Reset list for this batch
                         if max_aug > 0 and num_available_augs > 0:
-                            N_augment_predicted = torch.randint(
+                            N_augment = torch.randint(
                                 low=min_aug,
-                                high=min(max_aug, num_available_augs) + 1,
+                                high=min(max_aug, num_available_augs) + 1, # Ensure high doesn't exceed available
                                 size=(1,),
                             ).item()
 
-                            if N_augment_predicted > 0:
-                                augmentations_lst_keys = list(self.augmenter.augmentations.keys())
+                            if N_augment > 0:
+                                augmentations_lst = list(self.augmenter.augmentations.keys())
                                 if self.augmenter.shuffle_augmentations:
-                                    random.shuffle(augmentations_lst_keys)
-                                selected_augmentations_for_log = augmentations_lst_keys[0:N_augment_predicted]
-                        
-                        wavs_after_augmentation, wav_lens_after_augmentation = self.augmenter(wavs_for_augmentation, wav_lens_for_augmentation)
-                        
-                        applied_augs_list = selected_augmentations_for_log 
-                        augmentation_applied_this_batch = True
-                        logging.debug(f"Augmenter Applied (Predicted N={N_augment_predicted}): {applied_augs_list if applied_augs_list else 'None selected by N_augment'}")
+                                    random.shuffle(augmentations_lst)
+                                # Select the names
+                                selected_augmentations_for_log = augmentations_lst[0:N_augment]
+                                applied_augs_list = selected_augmentations_for_log # Store for logging after call
+                                augmentation_applied_this_batch = True # Mark that we intend to augment
+                                
+                                # --- Now actually call the augmenter --- 
+                                # NOTE: The augmenter performs its own selection internally.
+                                # Our logging reflects the selection *predicted* by replicating the logic.
+                                wavs, wav_lens = self.augmenter(wavs, wav_lens)
+
+                        # Log the selection (or lack thereof) at DEBUG level
+                        logging.debug(f"Augmenter Selection: Target N={N_augment if 'N_augment' in locals() else 'N/A'}, Selected Keys={selected_augmentations_for_log if selected_augmentations_for_log else 'None'}")
 
                     except Exception as aug_e:
-                        logging.warning(f"Batch Augmentation failed: {aug_e}. Using original batch (already set).", exc_info=True)
+                        logging.warning(f"Batch Augmentation failed: {aug_e}. Using original batch.", exc_info=True)
+                        wavs = signals # Revert to original if augmentation fails
+                        wav_lens = signal_lens
                         applied_augs_list = [f"Error: {type(aug_e).__name__}"]
-                        augmentation_applied_this_batch = False 
-            
-            logging.debug(f"Augmentation status: applied_this_batch={augmentation_applied_this_batch}, final_applied_augs_logged={applied_augs_list if augmentation_applied_this_batch else 'None'}")
+                        augmentation_applied_this_batch = False # Augmentation failed
 
-            new_chunk_audio_list = []
-            new_chunk_texts_list = []
-            new_chunk_original_ids_list = [] 
-
-            current_concat_audio_segments = []
-            current_concat_text_segments = []
-            current_concat_original_id_segments = []
-            current_concat_duration_samples = 0
-            max_chunk_samples = int(29.5 * safe_hparams_get(self.hparams, "target_sample_rate", TARGET_SAMPLE_RATE))
-
-            for i in range(wavs_after_augmentation.shape[0]): 
-                actual_len_samples = int(wav_lens_after_augmentation[i].item() * wavs_after_augmentation.shape[1])
-                if actual_len_samples <= 0:
-                    logging.warning(f"Original ID {original_ids[i]} has zero or negative length ({actual_len_samples} samples) after augmentation. Skipping.")
-                    continue
-                
-                current_signal_unpadded = wavs_after_augmentation[i, :actual_len_samples]
-                
-                if current_signal_unpadded.ndim > 1:
-                    logging.warning(f"Signal for original ID {original_ids[i]} has {current_signal_unpadded.ndim} dimensions. Attempting to squeeze.")
-                    current_signal_unpadded = current_signal_unpadded.squeeze()
-                    if current_signal_unpadded.ndim > 1:
-                         logging.error(f"Could not make signal 1D for {original_ids[i]} (shape: {wavs_after_augmentation[i, :actual_len_samples].shape}). Skipping this signal.")
-                         continue
-                if current_signal_unpadded.ndim == 0: 
-                    logging.warning(f"Signal for original ID {original_ids[i]} is scalar after unpadding/squeeze (likely empty). Skipping.")
-                    continue
-
-                current_text = original_texts[i]
-                current_id = original_ids[i]
-
-                if current_concat_audio_segments and (current_concat_duration_samples + actual_len_samples > max_chunk_samples):
-                    final_audio_chunk = torch.cat(current_concat_audio_segments, dim=0)
-                    new_chunk_audio_list.append(final_audio_chunk)
-                    new_chunk_texts_list.append(" ".join(current_concat_text_segments))
-                    new_chunk_original_ids_list.append(list(current_concat_original_id_segments))
-
-                    current_concat_audio_segments = []
-                    current_concat_text_segments = []
-                    current_concat_original_id_segments = []
-                    current_concat_duration_samples = 0
-
-                current_concat_audio_segments.append(current_signal_unpadded)
-                current_concat_text_segments.append(current_text)
-                current_concat_original_id_segments.append(current_id)
-                current_concat_duration_samples += actual_len_samples
-
-                if current_concat_duration_samples >= max_chunk_samples:
-                    final_audio_chunk = torch.cat(current_concat_audio_segments, dim=0)
-                    new_chunk_audio_list.append(final_audio_chunk)
-                    new_chunk_texts_list.append(" ".join(current_concat_text_segments))
-                    new_chunk_original_ids_list.append(list(current_concat_original_id_segments))
-                    
-                    current_concat_audio_segments = []
-                    current_concat_text_segments = []
-                    current_concat_original_id_segments = []
-                    current_concat_duration_samples = 0
-
-            if current_concat_audio_segments:
-                final_audio_chunk = torch.cat(current_concat_audio_segments, dim=0)
-                new_chunk_audio_list.append(final_audio_chunk)
-                new_chunk_texts_list.append(" ".join(current_concat_text_segments))
-                new_chunk_original_ids_list.append(list(current_concat_original_id_segments))
-
-            if not new_chunk_audio_list:
-                logging.warning("No valid audio chunks were formed after concatenation. Returning dummy data.")
-                bsz_dummy_chunks = 1 
-                mel_bins = getattr(self.processor.feature_extractor, 'feature_size', 80) if hasattr(self, 'processor') and self.processor and hasattr(self.processor, 'feature_extractor') else 80
-                has_whisper_module = isinstance(self.modules, torch.nn.ModuleDict) and 'whisper' in self.modules
-                model_dtype_fallback = next(self.modules['whisper'].parameters()).dtype if has_whisper_module else torch.float32
-                dummy_features = torch.zeros((bsz_dummy_chunks, mel_bins, 3000), device=self.device, dtype=model_dtype_fallback) # Whisper expects 3000 frames (30s)
-                dummy_mask = torch.ones((bsz_dummy_chunks, 3000), device=self.device, dtype=torch.long) # Corresponding mask
-                dummy_tokens_val = torch.full((bsz_dummy_chunks, 1), self.pad_token_id if self.pad_token_id is not None else 0, dtype=torch.long, device=self.device)
-                dummy_texts_list = ["<dummy_preprocessing_error>"] * bsz_dummy_chunks
-                dummy_ids_list_of_lists = [["<dummy_id_error>"]] * bsz_dummy_chunks
-                return (dummy_features, dummy_mask, dummy_tokens_val, dummy_tokens_val, dummy_tokens_val, dummy_texts_list, dummy_ids_list_of_lists)
-
-            raw_audio_waveforms_for_processor = new_chunk_audio_list 
-            texts_for_tokenization = new_chunk_texts_list
-            ids_for_downstream = new_chunk_original_ids_list
-
-            # === MODIFICATION START: Use HF Processor end-to-end ===
-            if self.processor is None: # Ensure processor is available
-                raise ValueError("Processor (self.processor) is not initialized in WhisperFineTuneBrain.")
+            # --- Log applied augmentations --- 
+            # Log level can be adjusted (e.g., INFO more higher verbosity)
+            logging.debug(f"Batch Augmentations Applied (Predicted): {applied_augs_list if augmentation_applied_this_batch else 'None'}")
 
             try:
-                # Convert audio tensors to float32 before numpy conversion
-                processed_audio = self.processor.feature_extractor(
-                        raw_speech=[w.cpu().numpy() for w in raw_audio_waveforms_for_processor],
-                        sampling_rate=TARGET_SAMPLE_RATE,
-                        return_tensors="pt",
-                        padding="max_length",
-                        truncation=True,
-                        return_attention_mask=True,
-                ).to(torch.float16)      # << single-line alternative
-                
-                # Create input_features object with consistent attention_mask
-                processed_audio_from_processor = type('obj', (object,), {
-                    'input_features': processed_audio.input_features,
-                    'attention_mask': processed_audio.attention_mask
-                })
-                
-                # After our custom processing, we should always have an attention mask
-                encoder_attention_mask = processed_audio_from_processor.attention_mask.to(self.device)
-                input_features = processed_audio_from_processor.input_features.to(self.device)
-
-                model_dtype = next(self.modules["whisper"].parameters()).dtype   # float16 in your run
-                input_features = input_features.to(model_dtype)                  # 🔧 make types match
-                
-                # Double-check the attention mask shape and validity
-                if encoder_attention_mask is None or encoder_attention_mask.shape[0] != input_features.shape[0]:
-                    logging.warning("Invalid attention mask shape. Creating a default attention mask.")
-                    encoder_attention_mask = torch.ones_like(input_features[..., 0], dtype=torch.long, device=self.device)
-
-
-            except Exception as proc_e:
-                logging.error(f"Error during HF Processor call on concatenated chunks: {proc_e}. Will attempt to continue with dummy features.", exc_info=True)
-                B_chunks = len(raw_audio_waveforms_for_processor)
-                has_whisper_module = isinstance(self.modules, torch.nn.ModuleDict) and 'whisper' in self.modules
-                model_dtype_fallback = next(self.modules['whisper'].parameters()).dtype if has_whisper_module else torch.float32
-                # Ensure mel_bins uses the processor's feature_extractor's feature_size if available
-                mel_bins = getattr(self.processor.feature_extractor, 'feature_size', 80) if hasattr(self, 'processor') and self.processor and hasattr(self.processor, 'feature_extractor') else 80
-                input_features = torch.zeros((B_chunks, mel_bins, 3000), device=self.device, dtype=model_dtype_fallback) # Whisper max length
-                encoder_attention_mask = torch.ones((B_chunks, 3000), device=self.device, dtype=torch.long) # Corresponding mask
-            # === MODIFICATION END ===
-
-            # === Tokenization (of new concatenated texts) ===
-            # This part remains largely the same, as it deals with text, not audio features.
-            try:
-                if self.tokenizer is None:
-                    raise ValueError("Tokenizer is not initialized. Make sure processor was properly set.")
-                if self.decoder_start_ids is None or self.eos_index is None or self.pad_token_id is None:
-                     raise ValueError("Decoder start IDs, EOS index, or PAD token ID is not set in the Brain class.")
-
-                tokens_list_initial = [self.tokenizer.encode(t) for t in texts_for_tokenization]
-                
-                valid_indices = []
-                final_texts_for_tokenization = []
-                final_ids_for_downstream = []
-                final_tokens_list = []
-
-                for i, (text_chunk, id_chunk, token_chunk) in enumerate(zip(texts_for_tokenization, ids_for_downstream, tokens_list_initial)):
-                    if token_chunk: 
-                        valid_indices.append(i)
-                        final_texts_for_tokenization.append(text_chunk)
-                        final_ids_for_downstream.append(id_chunk)
-                        final_tokens_list.append(token_chunk)
-                    else:
-                        logging.warning(f"Skipping chunk with original IDs {id_chunk} due to empty tokenization for text: '{text_chunk}'")
-
-                if not valid_indices:
-                    logging.warning("All chunks in the batch resulted in empty tokenizations. Returning dummy data.")
-                    bsz_dummy_chunks = 1
-                    mel_bins = getattr(self.processor.feature_extractor, 'feature_size', 80) if hasattr(self, 'processor') and self.processor and hasattr(self.processor, 'feature_extractor') else 80
-                    has_whisper_module = isinstance(self.modules, torch.nn.ModuleDict) and 'whisper' in self.modules
-                    model_dtype_fallback = next(self.modules['whisper'].parameters()).dtype if has_whisper_module else torch.float32
-                    dummy_features = torch.zeros((bsz_dummy_chunks, mel_bins, 3000), device=self.device, dtype=model_dtype_fallback)
-                    dummy_mask = torch.ones((bsz_dummy_chunks, 3000), device=self.device, dtype=torch.long)
-                    dummy_single_token_id = self.pad_token_id if self.pad_token_id is not None else (self.sot_index if self.sot_index is not None else 0)
-                    dummy_tokens_val = torch.full((bsz_dummy_chunks, 1), dummy_single_token_id, dtype=torch.long, device=self.device)
-                    dummy_texts_list = ["<dummy_all_chunks_empty_tokenization>"] * bsz_dummy_chunks
-                    dummy_ids_list_of_lists = [["<dummy_id_all_chunks_empty_tokenization>"]] * bsz_dummy_chunks
-                    return (dummy_features, dummy_mask, dummy_tokens_val, dummy_tokens_val, dummy_tokens_val, dummy_texts_list, dummy_ids_list_of_lists)
-
-                input_features = torch.index_select(input_features, 0, torch.tensor(valid_indices, device=input_features.device))
-                encoder_attention_mask = torch.index_select(encoder_attention_mask, 0, torch.tensor(valid_indices, device=encoder_attention_mask.device))
-                
-                texts_for_tokenization = final_texts_for_tokenization
-                ids_for_downstream = final_ids_for_downstream
-                tokens_list = final_tokens_list
-
-                if any(not t for t in texts_for_tokenization): 
-                    logging.warning(f"Empty text found in *filtered* chunked batch (should not happen if filtering worked): {texts_for_tokenization}.")
-                if any(not tk for tk in tokens_list): 
-                    logging.warning(f"Empty token list after *filtering* for chunked texts (should not happen if filtering worked): {texts_for_tokenization} -> {tokens_list}.")
+                tokens_list = [self.tokenizer.encode(t) for t in texts]
+                if any(not t for t in texts): logging.warning(f"Empty text found in batch: {texts}.")
+                if any(not tk for tk in tokens_list): logging.warning(f"Empty token list after encoding: {texts} -> {tokens_list}.")
 
                 bos_tokens_list = [torch.LongTensor(self.decoder_start_ids + t) for t in tokens_list]
                 eos_tokens_list = [torch.LongTensor(t + [self.eos_index]) for t in tokens_list]
                 target_tokens_list = [torch.LongTensor(t) for t in tokens_list]
 
             except Exception as e:
-                 logging.error(f"Error encoding/creating token lists for chunks: {e}. Texts: {texts_for_tokenization}", exc_info=True)
-                 raise ValueError(f"Error creating token lists for chunks: {e}")
+                 logging.error(f"Error encoding/creating token lists: {e}. Texts: {texts}")
+                 raise ValueError(f"Error creating token lists: {e}")
 
+            # Pad sequences
             try:
                 tokens_bos_padded = rnn_utils.pad_sequence(bos_tokens_list, batch_first=True, padding_value=self.pad_token_id).to(self.device)
                 tokens_eos_padded = rnn_utils.pad_sequence(eos_tokens_list, batch_first=True, padding_value=self.pad_token_id).to(self.device)
                 tokens_padded = rnn_utils.pad_sequence(target_tokens_list, batch_first=True, padding_value=self.pad_token_id).to(self.device)
             except Exception as e:
-                 logging.error(f"Error padding token sequences for chunks: {e}. BOS List lengths: {[len(t) for t in bos_tokens_list]}", exc_info=True)
-                 bsz_chunks = len(texts_for_tokenization)
-                 max_len_fallback = 1 
-                 if bos_tokens_list and any(bos_tokens_list): max_len_fallback = max(len(t) for t in bos_tokens_list if t) if any(len(t) > 0 for t in bos_tokens_list if t) else 1
+                 logging.error(f"Error padding token sequences: {e}. BOS List lengths: {[len(t) for t in bos_tokens_list]}")
+                 bsz = len(texts); max_len_fallback = 1
+                 tokens_bos_padded = torch.full((bsz, max_len_fallback), self.pad_token_id, dtype=torch.long, device=self.device)
+                 tokens_eos_padded = torch.full((bsz, max_len_fallback), self.pad_token_id, dtype=torch.long, device=self.device)
+                 tokens_padded = torch.full((bsz, max_len_fallback), self.pad_token_id, dtype=torch.long, device=self.device)
 
-                 tokens_bos_padded = torch.full((bsz_chunks, max_len_fallback), self.pad_token_id, dtype=torch.long, device=self.device)
-                 tokens_eos_padded = torch.full((bsz_chunks, max_len_fallback), self.pad_token_id, dtype=torch.long, device=self.device)
-                 tokens_padded = torch.full((bsz_chunks, max_len_fallback), self.pad_token_id, dtype=torch.long, device=self.device)
-            
-            tokens_bos = tokens_bos_padded
-            tokens_eos = tokens_eos_padded
-            tokens = tokens_padded
+            # **IMPORTANT**: Calculate token lengths based on the *original* token lists, NOT the potentially modified wav_lens
+            bos_max_len = tokens_bos_padded.shape[1]
+            eos_max_len = tokens_eos_padded.shape[1]
+            tok_max_len = tokens_padded.shape[1]
 
-            return input_features, encoder_attention_mask, tokens_bos, tokens_eos, tokens, texts_for_tokenization, ids_for_downstream
+            tokens_bos_lens_rel = (torch.tensor([len(t) for t in bos_tokens_list], device=self.device, dtype=torch.float) / bos_max_len
+                                   if bos_max_len > 0 else torch.zeros(tokens_bos_padded.shape[0], device=self.device, dtype=torch.float))
+            tokens_eos_lens_rel = (torch.tensor([len(t) for t in eos_tokens_list], device=self.device, dtype=torch.float) / eos_max_len
+                                   if eos_max_len > 0 else torch.zeros(tokens_eos_padded.shape[0], device=self.device, dtype=torch.float))
+            tokens_lens_rel = (torch.tensor([len(t) for t in target_tokens_list], device=self.device, dtype=torch.float) / tok_max_len
+                               if tok_max_len > 0 else torch.zeros(tokens_padded.shape[0], device=self.device, dtype=torch.float))
+
+            # Package into tuples
+            tokens_bos = (tokens_bos_padded, tokens_bos_lens_rel)
+            tokens_eos = (tokens_eos_padded, tokens_eos_lens_rel)
+            tokens = (tokens_padded, tokens_lens_rel) # For metrics reference
+
+            # Return the potentially augmented wavs and their corresponding lengths
+            return wavs.to(self.device), wav_lens.to(self.device), tokens_bos, tokens_eos, tokens, texts
 
         except Exception as e:
-            logging.error(f"Critical Error in _preprocess_batch (after concatenation logic): {e}", exc_info=True)
-            bsz_dummy_chunks = batch.batch_size if hasattr(batch, 'batch_size') and batch.batch_size > 0 else 1
-            has_whisper_module = isinstance(self.modules, torch.nn.ModuleDict) and 'whisper' in self.modules
-            model_dtype_fallback = next(self.modules['whisper'].parameters()).dtype if has_whisper_module else torch.float32
-            mel_bins = getattr(self.processor.feature_extractor, 'feature_size', 80) if hasattr(self, 'processor') and self.processor and hasattr(self.processor, 'feature_extractor') else 80
-            dummy_features = torch.zeros((bsz_dummy_chunks, mel_bins, 3000), device=self.device, dtype=model_dtype_fallback)
-            dummy_mask = torch.ones((bsz_dummy_chunks, 3000), device=self.device, dtype=torch.long)
-            dummy_tokens_val = torch.full((bsz_dummy_chunks, 1), self.pad_token_id if self.pad_token_id is not None else 0, dtype=torch.long, device=self.device)
-            dummy_texts_list = ["<dummy_preprocessing_error>"] * bsz_dummy_chunks
-            dummy_ids_list_of_lists = [["<dummy_id_error>"]] * bsz_dummy_chunks
-            return (dummy_features, dummy_mask, dummy_tokens_val, dummy_tokens_val, dummy_tokens_val, dummy_texts_list, dummy_ids_list_of_lists)
-# Inside WhisperFineTuneBrain class
+            logging.error(f"Critical Error in _preprocess_batch: {e}", exc_info=True)
+            # Attempt to return dummy data matching expected types
+            bsz = batch.batch_size if hasattr(batch, 'batch_size') else 1
+            dummy_wavs = torch.zeros((bsz, 1), device=self.device)
+            dummy_lens = torch.zeros(bsz, device=self.device)
+            dummy_tokens = torch.full((bsz, 1), self.pad_token_id, dtype=torch.long, device=self.device)
+            dummy_tok_lens = torch.zeros(bsz, device=self.device, dtype=torch.float)
+            dummy_texts = ["preprocessing_error"] * bsz
+            return (dummy_wavs, dummy_lens,
+                    (dummy_tokens, dummy_tok_lens), (dummy_tokens, dummy_tok_lens),
+                    (dummy_tokens, dummy_tok_lens), dummy_texts)
+
 
     # --- compute_forward (Using getattr for hparams access) ---
     def compute_forward(self, batch, stage):
         """Runs preprocessing and the Whisper model forward pass."""
         try:
-            # MODIFIED: Unpack 7 items directly from _preprocess_batch
-            # tokens_bos, tokens_eos, tokens are now direct tensors.
-            input_features, encoder_attention_mask, tokens_bos, \
-            tokens_eos, tokens, texts_for_chunks, ids_for_chunks = self._preprocess_batch(batch, stage)
+            # Call preprocess ONCE and get all required outputs
+            wavs, wav_lens, tokens_bos_data, tokens_eos_data, tokens_data, texts = self._preprocess_batch(batch, stage)
+            tokens_bos, _ = tokens_bos_data # Unpack for model input
 
-            if input_features is None or tokens_bos is None or input_features.numel() == 0 or tokens_bos.numel() == 0:
+            if wavs is None or tokens_bos is None or wavs.numel() == 0 or tokens_bos.numel() == 0:
                  logging.error("Empty/None tensors from preprocessing in compute_forward.")
-                 bsz_dummy_chunks = batch.batch_size if hasattr(batch, 'batch_size') and batch.batch_size > 0 else 1
-                 
-                 # Ensure tokenizer and modules are available for dummy data
-                 vocab_size = self.tokenizer.vocab_size if hasattr(self, 'tokenizer') and self.tokenizer else 50000 # Fallback
-                 has_whisper_module = isinstance(self.modules, torch.nn.ModuleDict) and 'whisper' in self.modules
-                 model_dtype_fallback = next(self.modules['whisper'].parameters()).dtype if has_whisper_module else torch.float32
-                
-                 dummy_log_probs = torch.zeros((bsz_dummy_chunks, 1, vocab_size), device=self.device, dtype=model_dtype_fallback)
-                 dummy_tokens_val = torch.full((bsz_dummy_chunks, 1), self.pad_token_id if self.pad_token_id is not None else 0, dtype=torch.long, device=self.device)
-                 dummy_texts_list = ["<dummy_preprocessing_error_cf>"] * bsz_dummy_chunks # CF for Compute Forward
-                 dummy_ids_list_of_lists = [["<dummy_id_error_cf>"]] * bsz_dummy_chunks
-                 # MODIFIED: Return signature: log_probs, hyps, tokens_eos, tokens, texts, ids (6 items)
-                 return (dummy_log_probs, None, dummy_tokens_val, dummy_tokens_val, dummy_texts_list, dummy_ids_list_of_lists)
+                 bsz = batch.batch_size if hasattr(batch, 'batch_size') else 1
+                 dummy_log_probs = torch.zeros((bsz, 1, self.tokenizer.vocab_size), device=self.device)
+                 dummy_wav_lens = torch.zeros(bsz, device=self.device)
+                 # Return dummy data matching the NEW expected structure
+                 dummy_tokens = torch.full((bsz, 1), self.pad_token_id, dtype=torch.long, device=self.device)
+                 dummy_tok_lens = torch.zeros(bsz, device=self.device, dtype=torch.float)
+                 dummy_texts = ["preprocessing_error"] * bsz
+                 return (dummy_log_probs, None, dummy_wav_lens,
+                         (dummy_tokens, dummy_tok_lens), (dummy_tokens, dummy_tok_lens), dummy_texts)
 
-            # Model forward pass with input_features and attention_mask
-            outputs = self.modules.whisper(
-                input_features=input_features,
-                decoder_input_ids=tokens_bos, # This is now directly the padded tensor
-                attention_mask=encoder_attention_mask 
-            )
-            logits = outputs.logits
+            # IMPORTANT: Explicitly cast input wavs to bfloat16 if using bf16 precision
+            # This ensures input type matches the model's parameter type (avoiding "Input type (float) and bias type (bfloat16)" error)
+            if wavs.dtype == torch.float32 and hasattr(self.hparams, "precision") and self.hparams.precision == "bf16":
+                logging.debug(f"Explicitly casting wavs from {wavs.dtype} to torch.bfloat16")
+                wavs = wavs.to(dtype=torch.bfloat16)
 
+            enc_out, logits, hyps = self.modules.whisper(wavs, tokens_bos)
+
+            # Directly compute log_softmax
             log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
 
+            # Check after log_softmax for numerical stability
             if not torch.all(torch.isfinite(log_probs)):
-                logging.error("NaN/Inf detected AFTER log_softmax. Loss will likely be NaN. Check model internal stability.")
+                logging.error("NaN/Inf detected AFTER log_softmax. Loss will likely be NaN.")
 
+            # --- Simple Greedy Decoding for evaluation ---
             hyps_out = None
-            if stage != sb.Stage.TRAIN: # For validation/test, generate hypotheses
+            if stage != sb.Stage.TRAIN:
                 try:
-                    if not hasattr(self, 'processor') or self.processor is None:
-                        logging.error("Processor not available for generation. Skipping hyps output.")
-                    else:
-                        forced_decoder_ids = self.processor.get_decoder_prompt_ids(
-                            language=safe_hparams_get(self.hparams, "language", "ar"),
-                            task=safe_hparams_get(self.hparams, "task", "transcribe"),
-                        )
-                        generate_ids = self.modules.whisper.generate(
-                            input_features=input_features,
-                            attention_mask=encoder_attention_mask,
-                            num_beams=getattr(self.hparams, "num_beams", 5),
-                            # length_penalty=1.0, # You can add other generation params if needed
-                            forced_decoder_ids=forced_decoder_ids
-                        )
-                        hyps_out = generate_ids.detach().cpu().tolist()
+                    # Greedy selection of most probable token at each timestep
+                    pred_tokens = torch.argmax(logits, dim=-1)  # [B, T]
+                    hyps_out = pred_tokens.detach().cpu().tolist()  # Convert to list for tokenizer.decode
                 except Exception as dec_e:
-                    logging.error(f"Error during beam search generation: {dec_e}", exc_info=True)
-            
-            # MODIFIED: Return signature: log_probs, hyps, tokens_eos, tokens, texts_for_chunks, ids_for_chunks (6 items)
-            return log_probs, hyps_out, tokens_eos, tokens, texts_for_chunks, ids_for_chunks
+                    logging.error(f"Error during greedy decoding: {dec_e}")
+                    hyps_out = None
+
+            # Return model outputs AND the target info from the single preprocess call
+            return log_probs, hyps_out, wav_lens.to(self.device), tokens_eos_data, tokens_data, texts
 
         except Exception as e:
              logging.error(f"Error in compute_forward: {e}", exc_info=True)
-             bsz_dummy_chunks = batch.batch_size if hasattr(batch, 'batch_size') and batch.batch_size > 0 else 1
-             vocab_size = self.tokenizer.vocab_size if hasattr(self, 'tokenizer') and self.tokenizer else 50000
-             has_whisper_module = isinstance(self.modules, torch.nn.ModuleDict) and 'whisper' in self.modules
-             model_dtype_fallback = next(self.modules['whisper'].parameters()).dtype if has_whisper_module else torch.float32
-             dummy_log_probs = torch.zeros((bsz_dummy_chunks, 1, vocab_size), device=self.device, dtype=model_dtype_fallback)
-             dummy_tokens_val = torch.full((bsz_dummy_chunks, 1), self.pad_token_id if self.pad_token_id is not None else 0, dtype=torch.long, device=self.device)
-             dummy_texts_list = ["<dummy_compute_forward_error>"] * bsz_dummy_chunks
-             dummy_ids_list_of_lists = [["<dummy_id_compute_forward_error>"]] * bsz_dummy_chunks
-             # MODIFIED: Return signature (6 items)
-             return (dummy_log_probs, None, dummy_tokens_val, dummy_tokens_val, dummy_texts_list, dummy_ids_list_of_lists)
+             bsz = batch.batch_size if hasattr(batch, 'batch_size') else 1
+             dummy_log_probs = torch.zeros((bsz, 1, self.tokenizer.vocab_size), device=self.device)
+             dummy_wav_lens = torch.zeros(bsz, device=self.device)
+             # Return dummy data matching the NEW expected structure
+             dummy_tokens = torch.full((bsz, 1), self.pad_token_id, dtype=torch.long, device=self.device)
+             dummy_tok_lens = torch.zeros(bsz, device=self.device, dtype=torch.float)
+             dummy_texts = ["preprocessing_error"] * bsz
+             return (dummy_log_probs, None, dummy_wav_lens,
+                     (dummy_tokens, dummy_tok_lens), (dummy_tokens, dummy_tok_lens), dummy_texts)
 
 
     # --- compute_objectives (Mostly unchanged, relies on preprocessing fix) ---
     def compute_objectives(self, predictions, batch, stage):
         """Computes the loss and evaluation metrics."""
         try:
-            # MODIFIED: Unpack predictions from compute_forward (6 items)
-            # tokens_eos_padded and tokens_padded are now direct tensors.
-            log_probs, hyps, tokens_eos_padded, tokens_padded, \
-            target_words_for_chunks, ids_for_chunks = predictions
+            # Unpack predictions from compute_forward (now includes targets)
+            log_probs, hyps, wav_lens, tokens_eos_data, tokens_data, target_words_raw = predictions
 
             if log_probs is None or not torch.all(torch.isfinite(log_probs)):
                  logging.error("Invalid log_probs (None, NaN/Inf) in compute_objectives. Returning zero loss.")
                  return torch.tensor(0.0, device=self.device, requires_grad=False)
+
+            ids = getattr(batch, 'id', [f'no_id_{i}' for i in range(log_probs.shape[0])])
             
-            if tokens_eos_padded is None: 
-                 logging.error("Missing target token data (tokens_eos_padded) in predictions.")
+            # Directly unpack target tokens from predictions
+            if tokens_eos_data is None or tokens_eos_data[0] is None:
+                 logging.error("Missing target token data (tokens_eos_data) in predictions.")
                  return torch.tensor(0.0, device=self.device, requires_grad=False)
+            tokens_eos_padded, tokens_eos_lens_rel = tokens_eos_data
+            # Unpack original tokens too, if needed for future metrics (not currently used in loss)
+            if tokens_data is None or tokens_data[0] is None:
+                 logging.warning("Missing original token data (tokens_data) in predictions.")
+                 # Set defaults if needed, though not used for loss calculation
+                 tokens_padded = None
+                 tokens_lens_rel = None
+            else:
+                 tokens_padded, tokens_lens_rel = tokens_data
 
-            if tokens_padded is None: # tokens_padded is used for reference in metrics if needed, not directly for loss here
-                 logging.warning("Missing original token data (tokens_padded) in predictions for reference.")
-
-            if tokens_eos_padded.numel() == 0:
+            if tokens_eos_padded is None or tokens_eos_padded.numel() == 0:
                 logging.error("Empty target tensor (tokens_eos_padded) in compute_objectives. Returning zero loss.")
                 return torch.tensor(0.0, device=self.device, requires_grad=False)
 
+            # --- Calculate Loss ---
             loss = torch.tensor(0.0, device=self.device, requires_grad=stage==sb.Stage.TRAIN)
-            try:
-                pad_id_for_len = self.pad_token_id
-                if pad_id_for_len is None: # Should be set from tokenizer
-                    logging.error("pad_token_id is None in compute_objectives. Loss might be incorrect.")
-                    # Attempt to use a common default or raise error
-                    pad_id_for_len = self.tokenizer.pad_token_id if hasattr(self.tokenizer, 'pad_token_id') and self.tokenizer.pad_token_id is not None else 0
+            # === Add these debug logs RIGHT BEFORE the try for loss calculation ===
+            logging.debug(f"COMPUTE_OBJECTIVES_DEBUG: Stage: {stage}")
+            logging.debug(f"COMPUTE_OBJECTIVES_DEBUG: Log_probs shape: {log_probs.shape}")
+            logging.debug(f"COMPUTE_OBJECTIVES_DEBUG: Tokens_eos_padded shape: {tokens_eos_padded.shape}")
+            logging.debug(f"COMPUTE_OBJECTIVES_DEBUG: Tokens_eos_padded dtype: {tokens_eos_padded.dtype}")
+            
+            min_target_val, max_target_val = None, None # Initialize before conditional assignment
+            if tokens_eos_padded.numel() > 0:
+                min_target_val = tokens_eos_padded.min().item()
+                max_target_val = tokens_eos_padded.max().item()
+                logging.debug(f"COMPUTE_OBJECTIVES_DEBUG: Min token_eos_padded: {min_target_val}")
+                logging.debug(f"COMPUTE_OBJECTIVES_DEBUG: Max token_eos_padded: {max_target_val}")
+            else:
+                logging.debug("COMPUTE_OBJECTIVES_DEBUG: Tokens_eos_padded is empty.")
                 
-                # Calculate absolute target lengths from the padded tensor
-                tgt_lens = (tokens_eos_padded != pad_id_for_len).sum(dim=-1).long()
-                
-                use_lengths_for_loss = (tgt_lens.numel() > 0 and torch.all(tgt_lens > 0))
+            vocab_size = log_probs.shape[-1] # Inferred n_classes
+            logging.debug(f"COMPUTE_OBJECTIVES_DEBUG: Inferred n_classes (vocab_size from log_probs): {vocab_size}")
+            logging.debug(f"COMPUTE_OBJECTIVES_DEBUG: Tokenizer vocab_size: {self.tokenizer.vocab_size}")
+            logging.debug(f"COMPUTE_OBJECTIVES_DEBUG: Hparams pad_token_id: {self.pad_token_id}")
 
-                label_smoothing = 0.0 # Default, can be overridden by hparams for train
-                if stage == sb.Stage.TRAIN:
-                    label_smoothing = getattr(self.hparams, "label_smoothing", 0.1)
-
-                if use_lengths_for_loss:
-                    loss = sb.nnet.losses.nll_loss(log_probs, tokens_eos_padded, length=tgt_lens, label_smoothing=label_smoothing)
+            # Check if any target is out of bounds [0, vocab_size - 1]
+            if min_target_val is not None and (min_target_val < 0 or max_target_val >= vocab_size):
+                logging.error(f"COMPUTE_OBJECTIVES_ERROR: Target token(s) out of bounds! Min: {min_target_val}, Max: {max_target_val}, Vocab Size: {vocab_size}")
+                # Optionally, print more details about the problematic batch items
+                # Ensure target_words_raw and ids are available and have the same batch dimension as tokens_eos_padded
+                if target_words_raw and ids and len(target_words_raw) == tokens_eos_padded.shape[0] and len(ids) == tokens_eos_padded.shape[0]:
+                    for i in range(tokens_eos_padded.shape[0]):
+                        # Check individual item bounds before attempting to get .min()/.max() on potentially empty slices
+                        if tokens_eos_padded[i].numel() > 0:
+                            item_min = tokens_eos_padded[i].min().item()
+                            item_max = tokens_eos_padded[i].max().item()
+                            if item_min < 0 or item_max >= vocab_size:
+                                logging.error(f"Problematic batch item {ids[i]} - Text: '{target_words_raw[i]}', Tokens: {tokens_eos_padded[i]}")
+                        else:
+                            logging.warning(f"COMPUTE_OBJECTIVES_DEBUG: Batch item {ids[i]} has empty tokens_eos_padded slice.")
                 else:
-                    logging.warning(f"Invalid tgt_lens detected (e.g., empty or contains zeros): {tgt_lens}. Using full padded length for NLL loss.")
-                    loss = sb.nnet.losses.nll_loss(log_probs, tokens_eos_padded, label_smoothing=label_smoothing)
+                    logging.warning("COMPUTE_OBJECTIVES_DEBUG: Cannot print problematic batch details due to mismatch in auxiliary info lengths or availability.")
+            # === End of debug logs ===
+            try:
+                # Check if we have valid lengths
+                use_lengths = (isinstance(tokens_eos_lens_rel, torch.Tensor) and
+                               tokens_eos_lens_rel.numel() > 0 and
+                               torch.all(tokens_eos_lens_rel > 0))
+
+                # Debug logging for lengths
+                if not use_lengths:
+                    logging.debug(f"Invalid tokens_eos_lens_rel: shape={tokens_eos_lens_rel.shape if isinstance(tokens_eos_lens_rel, torch.Tensor) else 'N/A'}, " + 
+                                  f"min={tokens_eos_lens_rel.min().item() if isinstance(tokens_eos_lens_rel, torch.Tensor) and tokens_eos_lens_rel.numel() > 0 else 'N/A'}, " +
+                                  f"max={tokens_eos_lens_rel.max().item() if isinstance(tokens_eos_lens_rel, torch.Tensor) and tokens_eos_lens_rel.numel() > 0 else 'N/A'}")
+
+                if use_lengths:
+                    logging.debug(f"Calling nll_loss with log_probs shape {log_probs.shape} and target shape {tokens_eos_padded.shape}, length tensor shape {tokens_eos_lens_rel.shape}")
+                    # Pass both the length masking AND explicitly set the pad_token_id to be ignored
+                    # This ensures padding tokens are properly ignored even if length masking fails
+                    loss = sb.nnet.losses.nll_loss(
+                        log_probs,
+                        tokens_eos_padded,
+                        length=tokens_eos_lens_rel,
+                    )
+                else:
+                    logging.debug(f"Calling nll_loss (no length) with log_probs shape {log_probs.shape} and target shape {tokens_eos_padded.shape}")
+                    logging.warning("Invalid target lengths for NLL loss. Using full padded length.")
+                    loss = sb.nnet.losses.nll_loss(
+                        log_probs, 
+                        tokens_eos_padded
+                    )
 
                 if not torch.isfinite(loss):
-                    logging.error("NaN or Inf loss calculated. Log Probs finite: {}, Targets shape: {}. Returning zero loss.".format(torch.all(torch.isfinite(log_probs)), tokens_eos_padded.shape))
+                    logging.error("NaN or Inf loss calculated. Log Probs finite: {}, Targets: {}. Returning zero loss.".format(torch.all(torch.isfinite(log_probs)), tokens_eos_padded.shape))
                     loss = torch.tensor(0.0, device=self.device, requires_grad=stage==sb.Stage.TRAIN)
 
             except Exception as loss_e:
-                logging.error(f"Error calculating NLL loss: {loss_e}", exc_info=True)
+                logging.error(f"Error calculating NLL loss: {loss_e}")
                 loss = torch.tensor(0.0, device=self.device, requires_grad=stage==sb.Stage.TRAIN)
 
-            if stage != sb.Stage.TRAIN and hyps is not None and self.tokenizer is not None:
+            # --- Calculate Metrics (WER/CER) ---
+            if stage != sb.Stage.TRAIN and hyps is not None:
                 try:
-                    predicted_words_for_chunks = self.tokenizer.batch_decode(hyps, skip_special_tokens=True)
-                    
-                    processed_chunk_ids_for_metric = []
-                    for original_id_list_for_chunk in ids_for_chunks: # ids_for_chunks is list of lists
-                        if isinstance(original_id_list_for_chunk, list):
-                            processed_chunk_ids_for_metric.append("_".join(map(str, original_id_list_for_chunk)))
-                        else: 
-                            processed_chunk_ids_for_metric.append(str(original_id_list_for_chunk))
+                    predicted_words = self.tokenizer.batch_decode(hyps, skip_special_tokens=True)
+                    target_words = target_words_raw # Raw text list
 
-                    # Ensure target_words_for_chunks are strings
-                    target_words_for_chunks_str = [str(t) for t in target_words_for_chunks]
+                    if not isinstance(predicted_words, list): predicted_words = [str(predicted_words)]
+                    if not isinstance(target_words, list): target_words = [str(target_words)]
+                    predicted_words = [str(p) for p in predicted_words]
+                    target_words = [str(t) for t in target_words]
 
-                    if len(processed_chunk_ids_for_metric) == len(predicted_words_for_chunks) == len(target_words_for_chunks_str):
-                         self.wer_metric.append(processed_chunk_ids_for_metric, predicted_words_for_chunks, target_words_for_chunks_str)
-                         self.cer_metric.append(processed_chunk_ids_for_metric, predicted_words_for_chunks, target_words_for_chunks_str)
+                    if len(ids) == len(predicted_words) == len(target_words):
+                         self.wer_metric.append(ids, predicted_words, target_words)
+                         self.cer_metric.append(ids, predicted_words, target_words)
                     else:
-                         logging.warning(f"Mismatch lengths for WER/CER: ids({len(processed_chunk_ids_for_metric)}), preds({len(predicted_words_for_chunks)}), targets({len(target_words_for_chunks_str)}). Skipping metrics for this batch.")
-                except Exception as metric_e: 
-                    logging.error(f"Error calculating WER/CER metrics: {metric_e}", exc_info=True)
-            
+                         logging.warning(f"Mismatch lengths for WER/CER: ids({len(ids)}), preds({len(predicted_words)}), targets({len(target_words)}). Skipping.")
+
+                except Exception as metric_e: logging.error(f"Error calculating WER/CER metrics: {metric_e}")
+
             if not isinstance(loss, torch.Tensor):
                 logging.error(f"Loss is not a tensor ({type(loss)}). Returning zero.")
                 loss = torch.tensor(0.0, device=self.device, requires_grad=stage==sb.Stage.TRAIN)
@@ -1387,207 +1259,130 @@ class WhisperFineTuneBrain(sb.Brain):
                 self.cer_metric.clear()
 
         return stage_stats
-    
-    
+
     def on_fit_start(self):
         try:
             super().on_fit_start()
-            # Now we can update these from the processor that was attached post-initialization
-            if hasattr(self, 'processor'):
-                self.tokenizer = self.processor.tokenizer
-                # self.feature_extractor = self.processor.feature_extractor # Keep or remove based on convenience
-                                                                           # _preprocess_batch now uses self.processor()
-                
-                # Update pad_token_id and decoder_start_ids if needed
-                if self.pad_token_id is None and self.tokenizer: # Check tokenizer exists
-                    self.pad_token_id = self.tokenizer.pad_token_id
-                if self.decoder_start_ids is None and self.sot_index is not None and self.tokenizer: # Check tokenizer exists
-                    self.decoder_start_ids = torch.tensor([[self.sot_index, self.tokenizer.lang_ids.get(self.whisper_language, None) or self.tokenizer.lang_ids.get('en', None)]] * len(self.device_ids), dtype=torch.long)
-            
-            # Configure AMP - Always use FP16 mix precision (BFloat16 not fully supported in features like GradScaler)
-            if not hasattr(self, 'amp_dtype'):
-                amp_dtype = self.hparams.get("amp_dtype", "float16")
-                if amp_dtype == "bfloat16":
-                    logging.warning("BFloat16 not fully supported by GradScaler, falling back to float16")
-                    amp_dtype = "float16"
-                self.amp_dtype = getattr(torch, amp_dtype)
-                logging.info(f"Setting AMP dtype to {self.amp_dtype}")
-
-            # Set up the training step counter and calculate total steps
-            # This section for total_train_steps might be for a different scheduler setup.
-            try:
-                # Use the new method to calculate total train steps
-                total_steps = self.calculate_total_train_steps()
-                if total_steps is not None:
-                    self.total_train_steps = total_steps
-                else:
-                    # Fallback to the original calculation if the new method fails
-                    steps_per_epoch = len(self.train_loader) if hasattr(self, 'train_loader') and self.train_loader else 0
-                    num_epochs = self.hparams.get("max_epochs", 1)
-                    grad_accum = self.hparams.get("grad_accumulation_factor", 1)
-                    self.total_train_steps = (steps_per_epoch * num_epochs) // grad_accum  # Total optimizer steps
-                
-                logging.info(f"Calculated total_train_steps (for potential schedulers): {self.total_train_steps}")
-            except Exception as e:
-                logging.warning(f"Could not calculate total_train_steps: {e}")
-                self.total_train_steps = 0
-        except Exception as e:
-            logging.error(f"Error in on_fit_start: {e}", exc_info=True)
+            self.avg_train_loss = 0.0 # Still needed for on_train_epoch_end
+            self._train_loss_buffer = []
+            self._current_epoch_train_loss = 0.0 # Initialize the new variable
+            logging.info("Fit started, initialized train loss tracking.")
+        except Exception as e: logging.error(f"Error in on_fit_start: {e}")
 
 
-    # Inside WhisperFineTuneBrain class, fit_batch method
-
+    # --- fit_batch (Extreme Gradient Stabilization) ---
     def fit_batch(self, batch):
         if not hasattr(self, 'optimizer') or not self.optimizer:
             logging.error("Optimizer not found in fit_batch!")
             return torch.tensor(0.0, device=self.device).cpu()
 
-        grad_accum = getattr(self.hparams, "grad_accumulation_factor", 1)
-        should_step = (self.step + 1) % grad_accum == 0
+        # --- Boilerplate and Warmup ---
+        grad_accum = getattr(self.hparams, "grad_accumulation_factor", 1)  # Default 1 if not set
+        should_step = (self.step + 1) % grad_accum == 0  # Correct step check for grad accum
+        loss = torch.tensor(0.0, device=self.device)
         
-        # Initialize optimizer_step_counter if it doesn't exist (e.g., first call)
-        if not hasattr(self, 'optimizer_step_counter'): 
-            self.optimizer_step_counter = 0
-
-        # --- MODIFIED LR WARMUP LOGIC ---
-        warmup_optimizer_steps_config = getattr(self.hparams, "lr_warmup_steps", 0) # Should be 500
-        base_lr = getattr(self.hparams, "learning_rate", 1e-5) # Should be 1e-5
-
-        current_lr_to_use = self.optimizer.param_groups[0]['lr'] # Start with current LR
-
-        if self.optimizer_step_counter < warmup_optimizer_steps_config:
-            # Linear warmup based on optimizer steps
-            warmup_factor = (self.optimizer_step_counter + 1) / warmup_optimizer_steps_config
-            current_lr_to_use = base_lr * warmup_factor
+        # Learning rate warmup
+        warmup_steps = getattr(self.hparams, "lr_warmup_steps", 0)  # Default 0
+        if hasattr(self, 'step_counter'):
+            self.step_counter += 1
+        else:
+            self.step_counter = 1
+            
+        # Apply learning rate warmup if we're in warmup phase
+        if self.step_counter < warmup_steps and hasattr(self, 'optimizer'):
+            warmup_factor = self.step_counter / max(1, warmup_steps)
+            base_lr = getattr(self.hparams, "learning_rate", 1e-5)
             for param_group in self.optimizer.param_groups:
-                param_group['lr'] = current_lr_to_use
-        # Else: After warmup, LR is managed by NewBobScheduler (via on_evaluate_end) 
-        # or remains at base_lr until the NewBobScheduler makes a change.
-        # --- END MODIFIED LR WARMUP LOGIC ---
-
-        loss = torch.tensor(0.0, device=self.device) 
+                param_group['lr'] = base_lr * warmup_factor
 
         try:
-            # Modified AMP setup
-            use_amp = getattr(self.hparams, "auto_mix_precision", False) and torch.cuda.is_available()
-            amp_dtype_str = getattr(self.hparams, "amp_dtype", "float16") 
-            amp_torch_dtype = torch.float16  # Always use float16 for AMP, even if bfloat16 is specified
-            
-            with torch.cuda.amp.autocast(enabled=use_amp, dtype=amp_torch_dtype):
-                outputs = self.compute_forward(batch, sb.Stage.TRAIN)
-                loss_val_from_objectives = self.compute_objectives(outputs, batch, sb.Stage.TRAIN) 
+            outputs = self.compute_forward(batch, sb.Stage.TRAIN)
+            loss = self.compute_objectives(outputs, batch, sb.Stage.TRAIN)
+            batch_loss_value = loss.detach().item()  # Get value for logging
 
-                if not isinstance(loss_val_from_objectives, torch.Tensor) or not loss_val_from_objectives.requires_grad:
-                    if isinstance(loss_val_from_objectives, torch.Tensor): 
-                        batch_loss_value = loss_val_from_objectives.detach().item()
-                    else: 
-                        batch_loss_value = float('nan')
-                    loss = torch.tensor(0.0, device=self.device) 
-                    valid_loss_for_backward = False
-                else:
-                    loss = loss_val_from_objectives 
-                    batch_loss_value = loss.detach().item()
-                    valid_loss_for_backward = True
-            
-            if valid_loss_for_backward:
+            # --- Loss Handling & Backward ---
+            if isinstance(loss, torch.Tensor) and loss.requires_grad:
                 if not torch.isfinite(loss):
                     logging.warning(f"Non-finite loss detected: {loss.item()}. Skipping backward/step.")
-                    batch_loss_value = float('nan') 
-                    loss = torch.tensor(0.0, device=self.device)
+                    batch_loss_value = float('nan')  # Record NaN for logging
+                    loss = torch.tensor(0.0, device=self.device)  # Avoid error in buffer append
                 else:
-                    loss_to_backward = loss / grad_accum 
-                    # Scale the loss for mixed precision training
-                    if use_amp and self.scaler:
-                        self.scaler.scale(loss_to_backward).backward()
-                    elif use_amp and not self.scaler: 
-                        logging.error("AMP enabled but GradScaler not initialized! Trying direct backward.")
-                        loss_to_backward.backward()
-                    else: 
-                        loss_to_backward.backward()
-            else: 
-                if not isinstance(loss, torch.Tensor): 
+                    try:
+                        scaled_loss = loss / grad_accum
+                        scaled_loss.backward()
+                    except Exception as e:
+                        logging.error(f"Error during backward(): {e}. Skipping step.")
+                        if self.optimizer:
+                            self.optimizer.zero_grad(set_to_none=True)
+                        should_step = False
+            else:
+                should_step = False  # Don't step if loss wasn't valid for backward
+                batch_loss_value = float('nan')  # Record NaN
+                if not isinstance(loss, torch.Tensor):
                     loss = torch.tensor(0.0, device=self.device)
 
-            current_grad_norm = float('nan') 
-            max_norm_val_log = float('nan') 
-
-            if should_step and valid_loss_for_backward and torch.isfinite(loss): 
+            # --- Grad Norm Calc, Clipping & Optimizer Step ---
+            current_grad_norm = float('nan')  # Initialize for logging
+            if should_step:  # Only if loss was valid and it's time to step
                 try:
-                    # FIX: Instead of trying to unscale gradients, use the scaler's step which handles unscaling
-                    # Comment out the direct unscale call to avoid FP16 gradient errors
+                    # Calculate gradient norm BEFORE clipping for logging
                     total_norm_sq = 0.0
                     max_norm_val = 0.0
+                    max_norm_name = None
+                    for n, p in self.modules.named_parameters():
+                        if p.grad is not None:
+                            param_norm = p.grad.data.norm(2).item()
+                            total_norm_sq += param_norm ** 2
+                            if param_norm > max_norm_val:
+                                max_norm_val = param_norm
+                                max_norm_name = n
+                    current_grad_norm = math.sqrt(total_norm_sq)
 
-                    if use_amp and self.scaler:
-                        # Skip manual gradient clipping when using AMP
-                        # Let the scaler handle step, which will also handle gradient unscaling
-                        self.scaler.step(self.optimizer)
-                        self.scaler.update()
-                    else:
-                        # Only manually clip gradients when not using AMP
-                        for p in self.modules.parameters(): 
-                            if p.grad is not None:
-                                param_norm = p.grad.data.norm(2).item()
-                                total_norm_sq += param_norm ** 2
-                                if param_norm > max_norm_val:
-                                    max_norm_val = param_norm
-                        current_grad_norm = math.sqrt(total_norm_sq) if total_norm_sq > 0 else 0.0
-                        max_norm_val_log = max_norm_val
+                    # Clip Gradients
+                    max_norm = getattr(self.hparams, "max_grad_norm", 5.0)
+                    torch.nn.utils.clip_grad_norm_(self.modules.parameters(), max_norm)
 
-                        max_grad_norm_hparam = getattr(self.hparams, "max_grad_norm", 5.0)
-                        torch.nn.utils.clip_grad_norm_(self.modules.parameters(), max_grad_norm_hparam)
-                        self.optimizer.step()
-                    
+                    # Optimizer Step
+                    self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
-                    self.optimizer_step_counter += 1 # Increment optimizer step counter HERE
 
                 except Exception as e:
-                    logging.error(f"Error during optimizer step/clipping/zero_grad: {e}", exc_info=True)
+                    logging.error(f"Error during optimizer step/clipping/zero_grad: {e}")
                     try:
-                        if self.optimizer: 
+                        if self.optimizer:
                             self.optimizer.zero_grad(set_to_none=True)
                     except Exception as zg_e:
                         logging.error(f"Error during zero_grad after step error: {zg_e}")
-            elif should_step and (not valid_loss_for_backward or not torch.isfinite(loss)):
-                logging.warning(f"Skipping optimizer step due to invalid/non-finite loss at step {self.step}.")
-                if self.optimizer:
-                    self.optimizer.zero_grad(set_to_none=True)
-            
-            # Log Batch Metrics to W&B
-            log_freq = getattr(self.hparams, "wandb_log_batch_freq", 0)
-            # Ensure wandb is imported if used here
-            if getattr(self.hparams, "use_wandb", False):
+
+            # --- Log Batch Metrics to W&B ---
+            log_freq = getattr(self.hparams, "wandb_log_batch_freq", 0)  # Default 0 (disabled)
+            if getattr(self.hparams, "use_wandb", False) and log_freq > 0 and (self.step + 1) % log_freq == 0:
                 try:
-                    import wandb # Keep import here or move to top of class/file
-                    if wandb.run and log_freq > 0 and (self.step + 1) % log_freq == 0:
+                    import wandb
+                    if wandb.run:
                         wandb_step_metrics = {
                             "train/batch_loss": batch_loss_value,
-                            "train/gradient_norm_clip": current_grad_norm,
-                            "train/max_param_grad_norm": max_norm_val_log,
-                            "train/learning_rate": current_lr_to_use, # Log the LR used for this batch
+                            "train/gradient_norm": current_grad_norm,
+                            "train/max_grad_norm": max_norm_val if 'max_norm_val' in locals() else float('nan'),
+                            "train/learning_rate": self.optimizer.param_groups[0]['lr'],
                             "trainer/global_step": self.step,
-                            "trainer/optimizer_step": self.optimizer_step_counter,
-                        }
-                        if use_amp and self.scaler:
-                            wandb_step_metrics["train/grad_scaler_scale"] = self.scaler.get_scale()
-                        
+                            "trainer/should_step": int(should_step),
+                        }         
+                        # Only log finite numerical values
                         wandb.log({k: v for k, v in wandb_step_metrics.items() if isinstance(v, (int, float)) and math.isfinite(v)})
-                except ImportError:
-                    logging.debug("wandb library not imported, cannot log batch metrics.") # Change to debug if it's optional
+
+                            
                 except Exception as wandb_log_e:
                     logging.warning(f"Could not log step metrics to W&B: {wandb_log_e}")
 
-
-            self._train_loss_buffer.append(batch_loss_value if math.isfinite(batch_loss_value) else 0.0)
+            # --- Accumulate loss for epoch average ---
+            self._train_loss_buffer.append(batch_loss_value)
 
         except Exception as e:
             logging.error(f"Error in fit_batch: {e}", exc_info=True)
-            loss_to_return = torch.tensor(float('nan')) 
-            self._train_loss_buffer.append(0.0) 
-        else:
-            loss_to_return = loss.cpu() if isinstance(loss, torch.Tensor) else torch.tensor(loss)
+            loss = torch.tensor(float('nan'))  # Return NaN on error
 
-        return loss_to_return
+        return loss.cpu() if isinstance(loss, torch.Tensor) else torch.tensor(loss)
 
 
     def on_train_epoch_end(self, epoch):
@@ -1688,37 +1483,6 @@ class WhisperFineTuneBrain(sb.Brain):
              if not (valid_stats and "WER" in valid_stats): missing.append("Valid WER metric")
              logging.info(f"Skipping LR update. Missing: {', '.join(missing)}")
 
-    def calculate_total_train_steps(self):
-        """
-        Calculate the total number of training steps based on dataset size, batch size, 
-        accumulation steps, and number of epochs
-        """
-        if not hasattr(self, 'train_dataloader') or self.train_dataloader is None:
-            logging.warning("No train_dataloader available to calculate total training steps")
-            return None
-            
-        try:
-            # Get number of batches per epoch
-            num_samples = len(self.train_dataloader.dataset)
-            batch_size = self.train_dataloader.batch_size
-            
-            # Account for batch size, accumulation steps and device count
-            effective_batch_size = batch_size * self.hparams.get("grad_accumulation_factor", 1)
-            num_devices = 1  # For modal, assume 1 device per container
-            
-            # Calculate batches and steps
-            batches_per_epoch = math.ceil(num_samples / effective_batch_size)
-            total_steps = batches_per_epoch * self.hparams.get("max_epochs", 1)
-            
-            logging.info(f"Total training steps: {total_steps} (samples: {num_samples}, " + 
-                         f"batch_size: {batch_size}, effective_batch_size: {effective_batch_size}, " +
-                         f"batches_per_epoch: {batches_per_epoch}, epochs: {self.hparams.get('max_epochs', 1)})")
-            
-            return total_steps
-        except Exception as e:
-            logging.warning(f"Error calculating total training steps: {e}")
-            return None
-
 
 print("WhisperFineTuneBrain defined.")
 # End of Cell 4
@@ -1756,7 +1520,7 @@ def train_whisper_on_modal():
                  logging.warning("WANDB_API_KEY environment variable NOT found. W&B initialization might fail.")
 
             # Use standard string formatting to avoid f-string quote issues
-            project_name = getattr(hparams, "wandb_project", "whisper-medium-egyptian-arabic") # Placeholder : Change this to your project's name on weights and biases
+            project_name = getattr(hparams, "wandb_project", "whisper-large-egyptian-arabic") # Placeholder : Change this to your project's name on weights and biases
             entity_name = hparams.get("wandb_entity", None) # Use .get()
             resume_id = hparams.get("wandb_resume_id", None) # Get the resume ID
 
@@ -1818,35 +1582,33 @@ def train_whisper_on_modal():
                 for i in range(torch.cuda.device_count()):
                     logging.info(f"GPU {i}: {torch.cuda.get_device_name(i)} Properties: {torch.cuda.get_device_properties(i)}")
                 logging.info(f"CUDA version: {torch.version.cuda}")
+                # PyTorch Backend Settings for Ampere+ GPUs
+                torch.backends.cuda.matmul.allow_tf32 = True
+                torch.set_float32_matmul_precision('high')
 
             logging.info("Importing speechbrain...")
             import speechbrain as sb
             logging.info(f"SpeechBrain version: {sb.__version__}")
 
             logging.info("Importing datasets...")
-            from datasets import load_dataset
+            from datasets import load_dataset, DatasetDict, Audio, concatenate_datasets
             logging.info("Datasets library imported successfully")
 
             logging.info("Importing SpeechBrain components...")
             from speechbrain.dataio.dataset import DynamicItemDataset
+            from speechbrain.dataio.dataloader import SaveableDataLoader
             from speechbrain.dataio.batch import PaddedBatch
             from speechbrain.dataio.sampler import DynamicBatchSampler
+            from speechbrain.utils.distributed import run_on_main, ddp_init_group
             # Revert logger import to only FileTrainLogger
             from speechbrain.utils.train_logger import FileTrainLogger 
-            # from speechbrain.lobes.models.huggingface_transformers.whisper import Whisper # Old import
-            from transformers import AutoModelForSpeechSeq2Seq, WhisperProcessor # New imports
+            from speechbrain.lobes.models.huggingface_transformers.whisper import Whisper
             logging.info("SpeechBrain components imported successfully")
 
             logging.info("Importing optimization libraries...")
             import torch.optim as optim
+            import pandas as pd
             import math
-            # Import bitsandbytes only inside the Modal function
-            try:
-                from bitsandbytes.optim import AdamW8bit
-                logging.info("Successfully imported AdamW8bit from bitsandbytes")
-            except ImportError:
-                logging.warning("Could not import bitsandbytes.optim.AdamW8bit, will use standard AdamW")
-                AdamW8bit = None
             logging.info("Optimization libraries imported successfully")
 
             logging.info("All imports completed successfully")
@@ -1920,43 +1682,11 @@ def train_whisper_on_modal():
         whisper_model = modules = optimizer = lr_scheduler = None
         try:
             logging.info("Initializing model, optimizer, scheduler...")
-            
-            # Load Processor
-            processor = WhisperProcessor.from_pretrained(
-                hparams.get("whisper_hub"),
-                cache_dir=CACHE_DIR # Use persistent cache
+            whisper_model = Whisper(
+                source=hparams.get("whisper_hub"), save_path=save_folder, encoder_only=False,
+                language=hparams.get("language"), task=hparams.get("task")
             )
-            
-            # Configuration of n_fft, hop_length, n_mels removed to use defaults from pretrained model
-            logging.info(f"Using default feature extractor configuration from {hparams.get('whisper_hub')}")
-            
-            # --- after loading the model ---
-            whisper_model = AutoModelForSpeechSeq2Seq.from_pretrained(
-                hparams["whisper_hub"],
-                torch_dtype=torch.float16,  # Changed from bfloat16 to float16
-                attn_implementation="flash_attention_2",
-                low_cpu_mem_usage=True,
-                use_safetensors=True,
-                cache_dir=CACHE_DIR,
-            )
-            whisper_model.to("cuda")             # move first
-            whisper_model.gradient_checkpointing_enable()
-            whisper_model.config.use_cache = False
-
-            logging.info(f"Whisper model loaded on {whisper_model.device} with Flash Attention 2 and BF16.")
-
-            # remove the failing assert
-            logging.info(f"FA-2 status: {getattr(whisper_model,'_attn_implementation', None)}")
-            
-            # --- MODIFICATION START: Flash Attention 2 checks ---
-            attn_impl = getattr(whisper_model, "_attn_implementation", None)
-            logging.info(f"Whisper model's _attn_implementation: {attn_impl}")
-            # Flash Attention may not be immediately available after .to('cuda')
-            # Continue without assertion to allow model to initialize properly
-             
-            # Only put the whisper_model in modules - processor is NOT a torch.nn.Module!
             modules = {"whisper": whisper_model}
-            
             no_decay = ['bias', 'LayerNorm.weight', 'layer_norm.weight']
             params = [
                 {'params': [p for n, p in modules["whisper"].named_parameters() if p.requires_grad and not any(nd in n for nd in no_decay)],
@@ -1964,61 +1694,13 @@ def train_whisper_on_modal():
                 {'params': [p for n, p in modules["whisper"].named_parameters() if p.requires_grad and any(nd in n for nd in no_decay)],
                  'weight_decay': 0.0, 'lr': hparams.get("learning_rate", 1e-7)}
             ]
-            
-            # Check if AdamW8bit is available and should be used from hparams
-            if hparams.get("optimizer_type", "AdamW") == "AdamW8bit" and 'AdamW8bit' in locals() and AdamW8bit is not None:
-                logging.info("Using AdamW8bit optimizer.")
-                # --- MODIFICATION START: Configure AdamW8bit ---
-                adam_kwargs = {
-                    "lr": hparams.get("learning_rate"), # Ensure LR is fetched (should be 1e-5 now)
-                    "betas": (0.9, 0.98), 
-                    "eps": 1e-6, # Adjusted eps as sometimes recommended for 8bit
-                    "weight_decay": hparams.get("weight_decay", 0.05)
-                    # Remove optim_kwargs as it's not supported in this version
-                }
-                logging.info(f"AdamW8bit kwargs: {adam_kwargs}")
-                optimizer = AdamW8bit( 
-                    params=params,                  
-                    **adam_kwargs
-                )
-                
-                # Create a linear schedule with warmup
-                if hparams.get("lr_scheduler_type") == "linear_with_warmup":
-                    try:
-                        # Try to estimate total steps from brain if available
-                        brain = WhisperFineTuneBrain(
-                            modules={"whisper": whisper_model},
-                            hparams=hparams,
-                            run_opts=None,
-                        )
-                        total_steps = brain.calculate_total_train_steps()
-                        warmup_steps = hparams.get("lr_warmup_steps", 0)
-                        
-                        if total_steps:
-                            logging.info(f"Setting up linear LR scheduler with warmup: total_steps={total_steps}, warmup_steps={warmup_steps}")
-                            lr_scheduler = get_linear_schedule_with_warmup(
-                                optimizer,
-                                num_warmup_steps=warmup_steps,
-                                num_training_steps=total_steps
-                            )
-                        else:
-                            logging.warning("Could not calculate total steps for LR scheduler. Using constant learning rate.")
-                            lr_scheduler = None
-                    except Exception as e:
-                        logging.error(f"Error setting up linear LR scheduler: {e}")
-                        lr_scheduler = None
-            else:
-                if hparams.get("optimizer_type", "AdamW") == "AdamW8bit":
-                    logging.warning("AdamW8bit was requested but is not available. Falling back to regular AdamW.")
-                logging.info("Using AdamW optimizer.")
-                optimizer = optim.AdamW(
-                    params=params,
-                    lr=hparams.get("learning_rate", 1e-7),
-                    betas=(0.9, 0.999),
-                    eps=1e-8,
-                    weight_decay=hparams.get("weight_decay", 0.05)
-                )
-
+            optimizer = optim.AdamW(
+                params=params,
+                lr=hparams.get("learning_rate", 1e-7),
+                betas=(0.9, 0.999),
+                eps=1e-8,
+                weight_decay=hparams.get("weight_decay", 0.05)
+            )
             lr_scheduler = sb.nnet.schedulers.NewBobScheduler(
                 initial_value=hparams.get("learning_rate"), improvement_threshold=hparams.get("lr_improvement_threshold", 0.0025),
                 annealing_factor=hparams.get("lr_annealing_factor"), patient=hparams.get("lr_patient", 0)
@@ -2063,7 +1745,7 @@ def train_whisper_on_modal():
                     logging.info(f"Successfully created DynamicItemDataset for split: {split} with {len(datasets_dict[split])} items.")
                 else:
                      logging.warning(f"Split '{split}' not found in loaded dataset. Skipping.")
-            if hparams.get("train_split") not in datasets_dict or hparams.get("valid_split") not in datasets_dict:
+            if not hparams.get("train_split") in datasets_dict or not hparams.get("valid_split") in datasets_dict:
                  logging.error("Essential train or validation dataset could not be created. Exiting.")
                  return
         except Exception as e:
@@ -2079,6 +1761,7 @@ def train_whisper_on_modal():
                 "num_workers": hparams.get("num_workers", 0),
                 "pin_memory": True if hparams.get("num_workers", 0) > 0 else False,
                 "prefetch_factor": 2 if hparams.get("num_workers", 0) > 0 else None,
+                "persistent_workers": True if hparams.get("num_workers", 0) > 0 else False, # Added persistent_workers
                 "collate_fn": PaddedBatch,
             }
             if dynamic_batching:
@@ -2145,7 +1828,7 @@ def train_whisper_on_modal():
             if epoch_counter: hparams['epoch_counter'] = epoch_counter
             hparams['train_logger'] = train_logger if train_logger else None
             device_type = "cuda" if torch.cuda.is_available() else "cpu"
-            run_opts = {"device": device_type}
+            run_opts = {"device": device_type, "precision": "bf16"} # Added "precision": "bf16"
             if torch.cuda.is_available() and torch.cuda.device_count() > 1:
                 run_opts.update({
                     "data_parallel_backend": "ddp",
@@ -2157,29 +1840,60 @@ def train_whisper_on_modal():
                 run_opts=run_opts, checkpointer=checkpointer
             )
             logging.info(f"WhisperFineTuneBrain initialized on device: {whisper_brain.device}")
-            # Add processor to the brain object but outside the modules dict
-            whisper_brain.processor = processor
-        except Exception as e: logging.error(f"Error initializing WhisperFineTuneBrain: {e}", exc_info=True); return
 
-        # --- WandB Watch Model (If enabled and wandb initialized) ---
-        # Check if wandb_run exists (meaning wandb.init was successful)
-        if wandb_run and hparams.get("wandb_watch_model", False):
-             try:
-                 import wandb 
-                 # Use .get() for watch frequency too
-                 watch_freq = hparams.get("wandb_watch_freq", 100) # Placeholder : Change this to your desired watch frequency
-                 # Watch the specific model module within the Brain class
-                 wandb.watch(whisper_brain.modules.whisper, log="gradients", log_freq=watch_freq)
-                 logging.info(f"WandB watching model gradients every {watch_freq} steps.")
-             except ImportError:
-                  logging.warning("wandb library not found, cannot watch model.")
-             except Exception as e:
-                 logging.warning(f"Could not set up wandb.watch: {e}")
-        else:
-             missing_watch_reasons = []
-             if not wandb_run: missing_watch_reasons.append("W&B run not initialized")
-             if not hparams.get("wandb_watch_model", False): missing_watch_reasons.append("W&B watch disabled in hparams")
-             if missing_watch_reasons: logging.info(f"Skipping wandb.watch because: {', '.join(missing_watch_reasons)}")
+            # --- Apply Hugging Face model specific optimizations ---
+            if hasattr(whisper_brain, 'modules') and 'whisper' in whisper_brain.modules:
+                sb_whisper_module = whisper_brain.modules.whisper
+                if hasattr(sb_whisper_module, 'model'): # Access the underlying HF model
+                    hf_model = sb_whisper_module.model
+
+                    # if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8: # Ampere+
+                    #     logging.info("Explicitly converting underlying Hugging Face model to bfloat16.")
+                    #     #hf_model.to(dtype=torch.bfloat16)
+                    
+                    # 2. Enable FlashAttention-2
+                    if hasattr(hf_model, 'config'):
+                        # Ensure transformers is imported to check version if needed, but it's globally imported.
+                        # current_transformers_version = transformers.__version__ 
+                        logging.info(f"Setting attn_implementation to flash_attention_2.")
+                        try:
+                            hf_model.config.attn_implementation = "flash_attention_2"
+                        except Exception as e_attn:
+                            logging.warning(f"Could not set attn_implementation='flash_attention_2': {e_attn}.")
+
+                        # 3. Enable Gradient Checkpointing & Disable Cache
+                        logging.info("Enabling gradient checkpointing on the Hugging Face model.")
+                        hf_model.gradient_checkpointing_enable()
+                        logging.info("Setting use_cache to False for gradient checkpointing.")
+                        hf_model.config.use_cache = False
+                    else:
+                        logging.warning("Could not configure HF model (attn, grad_checkpointing): hf_model.config not found.")
+                else:
+                    logging.warning("Could not access underlying Hugging Face model (sb_whisper_module.model not found) for optimizations.")
+            else:
+                logging.warning("Whisper module not found in brain.modules for HF model optimizations.")
+
+            # --- WandB Watch Model (If enabled and wandb initialized) ---
+            # Check if wandb_run exists (meaning wandb.init was successful)
+            if wandb_run and hparams.get("wandb_watch_model", False):
+                 try:
+                     import wandb 
+                     # Use .get() for watch frequency too
+                     watch_freq = hparams.get("wandb_watch_freq", 100) # Placeholder : Change this to your desired watch frequency
+                     # Watch the specific model module within the Brain class
+                     wandb.watch(whisper_brain.modules.whisper, log="gradients", log_freq=watch_freq)
+                     logging.info(f"WandB watching model gradients every {watch_freq} steps.")
+                 except ImportError:
+                      logging.warning("wandb library not found, cannot watch model.")
+                 except Exception as e:
+                     logging.warning(f"Could not set up wandb.watch: {e}")
+            else:
+                 missing_watch_reasons = []
+                 if not wandb_run: missing_watch_reasons.append("W&B run not initialized")
+                 if not hparams.get("wandb_watch_model", False): missing_watch_reasons.append("W&B watch disabled in hparams")
+                 if missing_watch_reasons: logging.info(f"Skipping wandb.watch because: {', '.join(missing_watch_reasons)}")
+
+        except Exception as e: logging.error(f"Error initializing WhisperFineTuneBrain: {e}", exc_info=True); return
 
         # --- Training ---
         train_set = datasets_dict.get(hparams.get("train_split"))
