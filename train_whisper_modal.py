@@ -98,49 +98,40 @@ CACHE_DIR = "/cache" # HF cache inside container
 CHECKPOINT_DIR = "/root/checkpoints" # Mount point inside container
 
 # --- Environment Image Definition ---
-# Use a CUDA development image as a base for flash-attn compilation
 modal_image = (
-    modal.Image.from_registry("nvidia/cuda:12.1.1-devel-ubuntu22.04", add_python="3.10")
-    .env({"CUDA_LAUNCH_BLOCKING": "1"}) 
+    modal.Image.debian_slim(python_version="3.10")
     .apt_install(
         "build-essential", "cmake", "libboost-all-dev",
         "libeigen3-dev", "git", "libsndfile1", "ffmpeg",
         "wget" 
     )
-    .pip_install(  # First install torch, torchaudio, torchvision - these are pre-compiled usually
-        "torch==2.3.1",
-        "torchaudio==2.3.1",
-        "torchvision==0.18.1"
-    )
-    .pip_install(  # Then install the rest of the packages
-                  # For flash-attn and bitsandbytes, specify gpu to ensure CUDA toolkit is available for compilation
-        [
-            "pip==23.3.2",
-            "setuptools==69.0.3",
-            "wheel==0.42.0",
-            "pyarrow==15.0.0",
-            "transformers==4.51.3",
-            "accelerate==0.32.1",
-            "wandb",
-            "speechbrain==1.0.3",
-            "librosa==0.10.1",
-            "datasets==2.16.1",
-            "huggingface_hub==0.30.0",
-            "sentencepiece==0.1.99",
-            "num2words==0.5.13",
-            "pyyaml==6.0.1",
-            "tqdm==4.66.1",
-            "pandas==2.1.4",
-            "soundfile==0.12.1",
-        ]
-    )
-    .pip_install( # Install flash-attn separately with GPU context for compilation
-        "flash-attn==2.5.8",
-        gpu="A100" # Or any compatible GPU type, A100 is what the function uses
-    )
-    .pip_install( # Install bitsandbytes separately with GPU context for compilation
-        "bitsandbytes==0.43.1",
-        gpu="A100"
+    .pip_install(
+        "pip==23.3.2",
+        "setuptools==69.0.3",
+        "wheel==0.42.0",
+        "pyarrow==15.0.0",      
+        # Core ML libraries
+        "torch==2.1.2",  # Latest stable that's well-tested with Whisper
+        "torchaudio==2.1.2",  # Matching torch version
+        "torchvision==0.16.2", # Add torchvision, compatible with torch 2.1.2
+        "transformers==4.51.3",  # Use latest
+        "accelerate==0.25.0",  # Latest stable
+        "wandb",  
+        # SpeechBrain and audio processing
+        "speechbrain==1.0.3",  # Latest stable
+        "librosa==0.10.1",  # Latest stable
+        # Hugging Face ecosystem
+        "datasets==2.16.1",  # Latest stable
+        "huggingface_hub==0.30.0",  # Latest stable
+        "sentencepiece==0.1.99",  # Latest stable
+        # Additional dependencies
+        "num2words==0.5.13",
+        "pyyaml==6.0.1",
+        "tqdm==4.66.1",
+        "pandas==2.1.4",
+        "soundfile==0.12.1",
+        "flash-attn==2.4.2",          # fused attention kernels
+        "bitsandbytes==0.45.4",   
     )
     # Download noise & RIR WAVs during image build, you will want to change this to increase the number of files 
     .run_commands(
@@ -265,10 +256,10 @@ hparams = {
     "lr_warmup_steps": 1000,
     "weight_decay": 0.05,
     "lr_annealing_factor": 0.9, # Used by NewBobScheduler
-    "batch_size_dynamic": True, # ENABLED DYNAMIC BATCHING 
-    "dynamic_batch_num_buckets": 60, # 
+    "batch_size_dynamic": False, # DISABLED DYNAMIC BATCHING
+    "dynamic_batch_num_buckets": 60, # (Not used when dynamic batching is False)
     "loader_batch_size": 12, # Used only if batch_size_dynamic is False
-    "max_batch_len_seconds": 80.0,
+    "max_batch_len_seconds": 40.0,
     "num_workers": 8,
     "grad_accumulation_factor": 2,
     "max_grad_norm": 5.0,
@@ -942,12 +933,6 @@ class WhisperFineTuneBrain(sb.Brain):
                  return (dummy_log_probs, None, dummy_wav_lens,
                          (dummy_tokens, dummy_tok_lens), (dummy_tokens, dummy_tok_lens), dummy_texts)
 
-            # IMPORTANT: Explicitly cast input wavs to bfloat16 if using bf16 precision
-            # This ensures input type matches the model's parameter type (avoiding "Input type (float) and bias type (bfloat16)" error)
-            if wavs.dtype == torch.float32 and hasattr(self.hparams, "precision") and self.hparams.precision == "bf16":
-                logging.debug(f"Explicitly casting wavs from {wavs.dtype} to torch.bfloat16")
-                wavs = wavs.to(dtype=torch.bfloat16)
-
             enc_out, logits, hyps = self.modules.whisper(wavs, tokens_bos)
 
             # Directly compute log_softmax
@@ -955,7 +940,7 @@ class WhisperFineTuneBrain(sb.Brain):
 
             # Check after log_softmax for numerical stability
             if not torch.all(torch.isfinite(log_probs)):
-                logging.error("NaN/Inf detected AFTER log_softmax. Loss will likely be NaN.")
+                logging.error("NaN/Inf detected AFTER log_softmax. Loss will likely be NaN. Check model internal stability.")
 
             # --- Simple Greedy Decoding for evaluation ---
             hyps_out = None
@@ -1017,72 +1002,18 @@ class WhisperFineTuneBrain(sb.Brain):
 
             # --- Calculate Loss ---
             loss = torch.tensor(0.0, device=self.device, requires_grad=stage==sb.Stage.TRAIN)
-            # === Add these debug logs RIGHT BEFORE the try for loss calculation ===
-            logging.debug(f"COMPUTE_OBJECTIVES_DEBUG: Stage: {stage}")
-            logging.debug(f"COMPUTE_OBJECTIVES_DEBUG: Log_probs shape: {log_probs.shape}")
-            logging.debug(f"COMPUTE_OBJECTIVES_DEBUG: Tokens_eos_padded shape: {tokens_eos_padded.shape}")
-            logging.debug(f"COMPUTE_OBJECTIVES_DEBUG: Tokens_eos_padded dtype: {tokens_eos_padded.dtype}")
-            
-            min_target_val, max_target_val = None, None # Initialize before conditional assignment
-            if tokens_eos_padded.numel() > 0:
-                min_target_val = tokens_eos_padded.min().item()
-                max_target_val = tokens_eos_padded.max().item()
-                logging.debug(f"COMPUTE_OBJECTIVES_DEBUG: Min token_eos_padded: {min_target_val}")
-                logging.debug(f"COMPUTE_OBJECTIVES_DEBUG: Max token_eos_padded: {max_target_val}")
-            else:
-                logging.debug("COMPUTE_OBJECTIVES_DEBUG: Tokens_eos_padded is empty.")
-                
-            vocab_size = log_probs.shape[-1] # Inferred n_classes
-            logging.debug(f"COMPUTE_OBJECTIVES_DEBUG: Inferred n_classes (vocab_size from log_probs): {vocab_size}")
-            logging.debug(f"COMPUTE_OBJECTIVES_DEBUG: Tokenizer vocab_size: {self.tokenizer.vocab_size}")
-            logging.debug(f"COMPUTE_OBJECTIVES_DEBUG: Hparams pad_token_id: {self.pad_token_id}")
-
-            # Check if any target is out of bounds [0, vocab_size - 1]
-            if min_target_val is not None and (min_target_val < 0 or max_target_val >= vocab_size):
-                logging.error(f"COMPUTE_OBJECTIVES_ERROR: Target token(s) out of bounds! Min: {min_target_val}, Max: {max_target_val}, Vocab Size: {vocab_size}")
-                # Optionally, print more details about the problematic batch items
-                # Ensure target_words_raw and ids are available and have the same batch dimension as tokens_eos_padded
-                if target_words_raw and ids and len(target_words_raw) == tokens_eos_padded.shape[0] and len(ids) == tokens_eos_padded.shape[0]:
-                    for i in range(tokens_eos_padded.shape[0]):
-                        # Check individual item bounds before attempting to get .min()/.max() on potentially empty slices
-                        if tokens_eos_padded[i].numel() > 0:
-                            item_min = tokens_eos_padded[i].min().item()
-                            item_max = tokens_eos_padded[i].max().item()
-                            if item_min < 0 or item_max >= vocab_size:
-                                logging.error(f"Problematic batch item {ids[i]} - Text: '{target_words_raw[i]}', Tokens: {tokens_eos_padded[i]}")
-                        else:
-                            logging.warning(f"COMPUTE_OBJECTIVES_DEBUG: Batch item {ids[i]} has empty tokens_eos_padded slice.")
-                else:
-                    logging.warning("COMPUTE_OBJECTIVES_DEBUG: Cannot print problematic batch details due to mismatch in auxiliary info lengths or availability.")
-            # === End of debug logs ===
             try:
-                # Check if we have valid lengths
                 use_lengths = (isinstance(tokens_eos_lens_rel, torch.Tensor) and
                                tokens_eos_lens_rel.numel() > 0 and
                                torch.all(tokens_eos_lens_rel > 0))
 
-                # Debug logging for lengths
-                if not use_lengths:
-                    logging.debug(f"Invalid tokens_eos_lens_rel: shape={tokens_eos_lens_rel.shape if isinstance(tokens_eos_lens_rel, torch.Tensor) else 'N/A'}, " + 
-                                  f"min={tokens_eos_lens_rel.min().item() if isinstance(tokens_eos_lens_rel, torch.Tensor) and tokens_eos_lens_rel.numel() > 0 else 'N/A'}, " +
-                                  f"max={tokens_eos_lens_rel.max().item() if isinstance(tokens_eos_lens_rel, torch.Tensor) and tokens_eos_lens_rel.numel() > 0 else 'N/A'}")
-
                 if use_lengths:
                     logging.debug(f"Calling nll_loss with log_probs shape {log_probs.shape} and target shape {tokens_eos_padded.shape}, length tensor shape {tokens_eos_lens_rel.shape}")
-                    # Pass both the length masking AND explicitly set the pad_token_id to be ignored
-                    # This ensures padding tokens are properly ignored even if length masking fails
-                    loss = sb.nnet.losses.nll_loss(
-                        log_probs,
-                        tokens_eos_padded,
-                        length=tokens_eos_lens_rel,
-                    )
+                    loss = sb.nnet.losses.nll_loss(log_probs, tokens_eos_padded, length=tokens_eos_lens_rel)
                 else:
                     logging.debug(f"Calling nll_loss (no length) with log_probs shape {log_probs.shape} and target shape {tokens_eos_padded.shape}")
                     logging.warning("Invalid target lengths for NLL loss. Using full padded length.")
-                    loss = sb.nnet.losses.nll_loss(
-                        log_probs, 
-                        tokens_eos_padded
-                    )
+                    loss = sb.nnet.losses.nll_loss(log_probs, tokens_eos_padded)
 
                 if not torch.isfinite(loss):
                     logging.error("NaN or Inf loss calculated. Log Probs finite: {}, Targets: {}. Returning zero loss.".format(torch.all(torch.isfinite(log_probs)), tokens_eos_padded.shape))
@@ -1520,7 +1451,7 @@ def train_whisper_on_modal():
                  logging.warning("WANDB_API_KEY environment variable NOT found. W&B initialization might fail.")
 
             # Use standard string formatting to avoid f-string quote issues
-            project_name = getattr(hparams, "wandb_project", "whisper-large-egyptian-arabic") # Placeholder : Change this to your project's name on weights and biases
+            project_name = getattr(hparams, "wandb_project", "whisper-medium-egyptian-arabic") # Placeholder : Change this to your project's name on weights and biases
             entity_name = hparams.get("wandb_entity", None) # Use .get()
             resume_id = hparams.get("wandb_resume_id", None) # Get the resume ID
 
@@ -1582,9 +1513,6 @@ def train_whisper_on_modal():
                 for i in range(torch.cuda.device_count()):
                     logging.info(f"GPU {i}: {torch.cuda.get_device_name(i)} Properties: {torch.cuda.get_device_properties(i)}")
                 logging.info(f"CUDA version: {torch.version.cuda}")
-                # PyTorch Backend Settings for Ampere+ GPUs
-                torch.backends.cuda.matmul.allow_tf32 = True
-                torch.set_float32_matmul_precision('high')
 
             logging.info("Importing speechbrain...")
             import speechbrain as sb
@@ -1761,7 +1689,6 @@ def train_whisper_on_modal():
                 "num_workers": hparams.get("num_workers", 0),
                 "pin_memory": True if hparams.get("num_workers", 0) > 0 else False,
                 "prefetch_factor": 2 if hparams.get("num_workers", 0) > 0 else None,
-                "persistent_workers": True if hparams.get("num_workers", 0) > 0 else False, # Added persistent_workers
                 "collate_fn": PaddedBatch,
             }
             if dynamic_batching:
@@ -1828,7 +1755,7 @@ def train_whisper_on_modal():
             if epoch_counter: hparams['epoch_counter'] = epoch_counter
             hparams['train_logger'] = train_logger if train_logger else None
             device_type = "cuda" if torch.cuda.is_available() else "cpu"
-            run_opts = {"device": device_type, "precision": "bf16"} # Added "precision": "bf16"
+            run_opts = {"device": device_type}
             if torch.cuda.is_available() and torch.cuda.device_count() > 1:
                 run_opts.update({
                     "data_parallel_backend": "ddp",
@@ -1840,60 +1767,27 @@ def train_whisper_on_modal():
                 run_opts=run_opts, checkpointer=checkpointer
             )
             logging.info(f"WhisperFineTuneBrain initialized on device: {whisper_brain.device}")
-
-            # --- Apply Hugging Face model specific optimizations ---
-            if hasattr(whisper_brain, 'modules') and 'whisper' in whisper_brain.modules:
-                sb_whisper_module = whisper_brain.modules.whisper
-                if hasattr(sb_whisper_module, 'model'): # Access the underlying HF model
-                    hf_model = sb_whisper_module.model
-
-                    # if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8: # Ampere+
-                    #     logging.info("Explicitly converting underlying Hugging Face model to bfloat16.")
-                    #     #hf_model.to(dtype=torch.bfloat16)
-                    
-                    # 2. Enable FlashAttention-2
-                    if hasattr(hf_model, 'config'):
-                        # Ensure transformers is imported to check version if needed, but it's globally imported.
-                        # current_transformers_version = transformers.__version__ 
-                        logging.info(f"Setting attn_implementation to flash_attention_2.")
-                        try:
-                            hf_model.config.attn_implementation = "flash_attention_2"
-                        except Exception as e_attn:
-                            logging.warning(f"Could not set attn_implementation='flash_attention_2': {e_attn}.")
-
-                        # 3. Enable Gradient Checkpointing & Disable Cache
-                        logging.info("Enabling gradient checkpointing on the Hugging Face model.")
-                        hf_model.gradient_checkpointing_enable()
-                        logging.info("Setting use_cache to False for gradient checkpointing.")
-                        hf_model.config.use_cache = False
-                    else:
-                        logging.warning("Could not configure HF model (attn, grad_checkpointing): hf_model.config not found.")
-                else:
-                    logging.warning("Could not access underlying Hugging Face model (sb_whisper_module.model not found) for optimizations.")
-            else:
-                logging.warning("Whisper module not found in brain.modules for HF model optimizations.")
-
-            # --- WandB Watch Model (If enabled and wandb initialized) ---
-            # Check if wandb_run exists (meaning wandb.init was successful)
-            if wandb_run and hparams.get("wandb_watch_model", False):
-                 try:
-                     import wandb 
-                     # Use .get() for watch frequency too
-                     watch_freq = hparams.get("wandb_watch_freq", 100) # Placeholder : Change this to your desired watch frequency
-                     # Watch the specific model module within the Brain class
-                     wandb.watch(whisper_brain.modules.whisper, log="gradients", log_freq=watch_freq)
-                     logging.info(f"WandB watching model gradients every {watch_freq} steps.")
-                 except ImportError:
-                      logging.warning("wandb library not found, cannot watch model.")
-                 except Exception as e:
-                     logging.warning(f"Could not set up wandb.watch: {e}")
-            else:
-                 missing_watch_reasons = []
-                 if not wandb_run: missing_watch_reasons.append("W&B run not initialized")
-                 if not hparams.get("wandb_watch_model", False): missing_watch_reasons.append("W&B watch disabled in hparams")
-                 if missing_watch_reasons: logging.info(f"Skipping wandb.watch because: {', '.join(missing_watch_reasons)}")
-
         except Exception as e: logging.error(f"Error initializing WhisperFineTuneBrain: {e}", exc_info=True); return
+
+        # --- WandB Watch Model (If enabled and wandb initialized) ---
+        # Check if wandb_run exists (meaning wandb.init was successful)
+        if wandb_run and hparams.get("wandb_watch_model", False):
+             try:
+                 import wandb 
+                 # Use .get() for watch frequency too
+                 watch_freq = hparams.get("wandb_watch_freq", 100) # Placeholder : Change this to your desired watch frequency
+                 # Watch the specific model module within the Brain class
+                 wandb.watch(whisper_brain.modules.whisper, log="gradients", log_freq=watch_freq)
+                 logging.info(f"WandB watching model gradients every {watch_freq} steps.")
+             except ImportError:
+                  logging.warning("wandb library not found, cannot watch model.")
+             except Exception as e:
+                 logging.warning(f"Could not set up wandb.watch: {e}")
+        else:
+             missing_watch_reasons = []
+             if not wandb_run: missing_watch_reasons.append("W&B run not initialized")
+             if not hparams.get("wandb_watch_model", False): missing_watch_reasons.append("W&B watch disabled in hparams")
+             if missing_watch_reasons: logging.info(f"Skipping wandb.watch because: {', '.join(missing_watch_reasons)}")
 
         # --- Training ---
         train_set = datasets_dict.get(hparams.get("train_split"))
