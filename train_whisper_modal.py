@@ -484,6 +484,9 @@ class WhisperFineTuneBrain(sb.Brain):
 
         super().__init__(modules, opt_class, hparams, run_opts, checkpointer)
         
+        # Initialize GradScaler for AMP
+        self.scaler = torch.cuda.amp.GradScaler(enabled=True)
+        
         try:
             self.tokenizer = self.modules.whisper.tokenizer
             # Access hparams using getattr for safety after super init
@@ -791,27 +794,32 @@ class WhisperFineTuneBrain(sb.Brain):
     def _preprocess_batch(self, batch, stage):
         """Applies augmentations and tokenization to the raw batch data."""
         try:
-            batch = batch.to(self.device)
-            if not isinstance(batch.signal_raw, (list, tuple)) or len(batch.signal_raw) != 2:
-                 logging.error(f"Unexpected batch.signal_raw format: {type(batch.signal_raw)}")
-                 raise ValueError("Invalid batch.signal_raw format")
+            # batch = batch.to(self.device) # DELAYED: Move data to device after CPU-bound augmentations
+            
+            # Ensure signals and their lengths are initially on CPU for augmentation
+            # PaddedBatch by default creates tensors on CPU if not specified,
+            # and batch.signal_raw directly gives (padded_tensor, rel_length_tensor)
+            signals, signal_lens = batch.signal_raw 
+            
+            # Ensure signals are on CPU if they aren't already (e.g. if PaddedBatch changes behavior)
+            if signals.device.type != 'cpu':
+                signals = signals.to('cpu')
+                signal_lens = signal_lens.to('cpu') # Keep consistent
 
-            # Get original signals and lengths (relative)
-            signals, signal_lens = batch.signal_raw
-            ids = getattr(batch, 'id', [f'no_id_{i}' for i in range(signals.shape[0])])
-            texts = batch.text_raw # Keep original texts for tokenization later
+            ids = getattr(batch, 'id', [f'no_id_{i}' for i in range(signals.shape[0])]) # Process on CPU
+            texts = batch.text_raw # Process on CPU
             if not isinstance(texts, list):
                  texts = [str(t) for t in texts] if hasattr(texts, '__iter__') else [str(texts)]
 
-            wavs = signals  # Start with original signals
-            wav_lens = signal_lens # Start with original relative lengths
+            wavs = signals  # Start with original signals on CPU
+            wav_lens = signal_lens # Start with original relative lengths on CPU
             applied_augs_list = [] # List to store names of applied augmentations for logging
             augmentation_applied_this_batch = False # Flag to track if augmentation happened
 
-            # ***** Apply SpeechBrain Augmenter to the whole batch *****
+            # ***** Apply SpeechBrain Augmenter to the whole batch (wavs are on CPU) *****
             if stage == sb.Stage.TRAIN and getattr(self.hparams, "augment", False) and self.augmenter is not None:
                 # Check probability BEFORE calling augmenter
-                if random.random() < self.augmenter.augment_prob:
+                if random.random() < self.augmenter.augment_prob: # Access hparams directly
                     try:
                         # --- Replicate selection logic for logging --- 
                         min_aug = max(0, self.augmenter.min_augmentations)
@@ -836,26 +844,30 @@ class WhisperFineTuneBrain(sb.Brain):
                                 augmentation_applied_this_batch = True # Mark that we intend to augment
                                 
                                 # --- Now actually call the augmenter --- 
-                                # NOTE: The augmenter performs its own selection internally.
-                                # Our logging reflects the selection *predicted* by replicating the logic.
+                                # Augmenter processes wavs (currently on CPU). 
+                                # Individual augmentations handle their device needs.
                                 wavs, wav_lens = self.augmenter(wavs, wav_lens)
 
                         # Log the selection (or lack thereof) at DEBUG level
                         logging.debug(f"Augmenter Selection: Target N={N_augment if 'N_augment' in locals() else 'N/A'}, Selected Keys={selected_augmentations_for_log if selected_augmentations_for_log else 'None'}")
 
                     except Exception as aug_e:
-                        logging.warning(f"Batch Augmentation failed: {aug_e}. Using original batch.", exc_info=True)
-                        wavs = signals # Revert to original if augmentation fails
+                        logging.warning(f"Batch Augmentation failed: {aug_e}. Using original batch (CPU signals).", exc_info=True)
+                        wavs = signals # Revert to original CPU signals
                         wav_lens = signal_lens
                         applied_augs_list = [f"Error: {type(aug_e).__name__}"]
                         augmentation_applied_this_batch = False # Augmentation failed
-
+            
             # --- Log applied augmentations --- 
-            # Log level can be adjusted (e.g., INFO more higher verbosity)
             logging.debug(f"Batch Augmentations Applied (Predicted): {applied_augs_list if augmentation_applied_this_batch else 'None'}")
 
+            # --- Move final wavs and wav_lens to target device before tokenization/model ---
+            # This ensures data is on the correct device after the augmentation chain.
+            wavs = wavs.to(self.device)
+            wav_lens = wav_lens.to(self.device) # Ensure lengths tensor is also on the correct device
+
             try:
-                tokens_list = [self.tokenizer.encode(t) for t in texts]
+                tokens_list = [self.tokenizer.encode(t) for t in texts] # texts are on CPU
                 if any(not t for t in texts): logging.warning(f"Empty text found in batch: {texts}.")
                 if any(not tk for tk in tokens_list): logging.warning(f"Empty token list after encoding: {texts} -> {tokens_list}.")
 
@@ -933,10 +945,11 @@ class WhisperFineTuneBrain(sb.Brain):
                  return (dummy_log_probs, None, dummy_wav_lens,
                          (dummy_tokens, dummy_tok_lens), (dummy_tokens, dummy_tok_lens), dummy_texts)
 
-            enc_out, logits, hyps = self.modules.whisper(wavs, tokens_bos)
-
-            # Directly compute log_softmax
-            log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
+            # AMP: Autocast for model forward pass
+            with torch.cuda.amp.autocast(dtype=torch.bfloat16, enabled=True):
+                enc_out, logits, hyps = self.modules.whisper(wavs, tokens_bos)
+                # Directly compute log_softmax
+                log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
 
             # Check after log_softmax for numerical stability
             if not torch.all(torch.isfinite(log_probs)):
@@ -1240,7 +1253,8 @@ class WhisperFineTuneBrain(sb.Brain):
                 else:
                     try:
                         scaled_loss = loss / grad_accum
-                        scaled_loss.backward()
+                        # AMP: Scale loss before backward
+                        self.scaler.scale(scaled_loss).backward()
                     except Exception as e:
                         logging.error(f"Error during backward(): {e}. Skipping step.")
                         if self.optimizer:
@@ -1256,6 +1270,9 @@ class WhisperFineTuneBrain(sb.Brain):
             current_grad_norm = float('nan')  # Initialize for logging
             if should_step:  # Only if loss was valid and it's time to step
                 try:
+                    # AMP: Unscale gradients before clipping
+                    self.scaler.unscale_(self.optimizer)
+
                     # Calculate gradient norm BEFORE clipping for logging
                     total_norm_sq = 0.0
                     max_norm_val = 0.0
@@ -1269,12 +1286,15 @@ class WhisperFineTuneBrain(sb.Brain):
                                 max_norm_name = n
                     current_grad_norm = math.sqrt(total_norm_sq)
 
-                    # Clip Gradients
+                    # Clip Gradients (on unscaled gradients)
                     max_norm = getattr(self.hparams, "max_grad_norm", 5.0)
                     torch.nn.utils.clip_grad_norm_(self.modules.parameters(), max_norm)
 
-                    # Optimizer Step
-                    self.optimizer.step()
+                    # AMP: Optimizer step via scaler
+                    self.scaler.step(self.optimizer)
+                    # AMP: Update scaler
+                    self.scaler.update()
+                    
                     self.optimizer.zero_grad(set_to_none=True)
 
                 except Exception as e:
@@ -1612,8 +1632,22 @@ def train_whisper_on_modal():
             logging.info("Initializing model, optimizer, scheduler...")
             whisper_model = Whisper(
                 source=hparams.get("whisper_hub"), save_path=save_folder, encoder_only=False,
-                language=hparams.get("language"), task=hparams.get("task")
+                language=hparams.get("language"), task=hparams.get("task"),
+                attn_implementation="flash_attention_2" # Add this line
             )
+
+            if hasattr(whisper_model, 'model'): # Check if the underlying HF model is accessible via 'model'
+                logging.info("Attempting to apply torch.compile() to the Whisper model...")
+                try:
+                    # It's generally recommended to compile the core nn.Module, 
+                    # which is often whisper_model.model for HF models wrapped in SpeechBrain.
+                    whisper_model.model = torch.compile(whisper_model.model)
+                    logging.info("Successfully applied torch.compile() to whisper_model.model.")
+                except Exception as e:
+                    logging.error(f"Error applying torch.compile(): {e}", exc_info=True)
+            else:
+                logging.warning("Could not find 'whisper_model.model' to apply torch.compile().")
+
             modules = {"whisper": whisper_model}
             no_decay = ['bias', 'LayerNorm.weight', 'layer_norm.weight']
             params = [
