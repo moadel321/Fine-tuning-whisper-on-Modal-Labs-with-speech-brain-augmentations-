@@ -1,13 +1,29 @@
 import logging
-import datetime
-import yaml  # Add yaml import
 import tempfile  # Add tempfile for safe temporary file handling
 import csv  # Add csv import for augmentation file handling
 import shutil  # For cleanup
 import math
 import torch.nn.functional as F
 from speechbrain.processing.signal_processing import  reverberate
-from datasets import load_dataset  # Global import for dataset loading in Brain
+
+# Helper function for safer hparams access
+def safe_hparams_get(hparams, key, default=None):
+    """
+    Safely get a parameter value from hparams, whether it's a dict or SimpleNamespace.
+    
+    Args:
+        hparams: Can be a dict or a SimpleNamespace
+        key: The parameter name to get
+        default: Default value if parameter doesn't exist
+        
+    Returns:
+        The parameter value or the default
+    """
+    if hasattr(hparams, key):  # For SimpleNamespace
+        return getattr(hparams, key)
+    elif isinstance(hparams, dict) and key in hparams:  # For dict
+        return hparams[key]
+    return default
 
 # Turn off tokenizers parallelism warnings
 import os
@@ -99,39 +115,43 @@ CHECKPOINT_DIR = "/root/checkpoints" # Mount point inside container
 
 # --- Environment Image Definition ---
 modal_image = (
-    modal.Image.debian_slim(python_version="3.10")
+    # Use Modal's pre-built CUDA image which has CUDA toolkit properly installed
+    modal.Image.from_registry(
+        "nvidia/cuda:12.1.0-devel-ubuntu22.04", 
+        add_python="3.10"
+    )
+    # Install system dependencies
     .apt_install(
         "build-essential", "cmake", "libboost-all-dev",
         "libeigen3-dev", "git", "libsndfile1", "ffmpeg",
-        "wget" 
+        "wget", "ninja-build", # Ninja is useful for faster compilation
     )
+    # First install core Python tools and PyTorch
+    .run_commands(
+        # Install pip and core packages
+        "python -m pip install --no-cache-dir --upgrade pip==23.3.2 setuptools==69.0.3 wheel==0.42.0",
+        # Install PyTorch with CUDA support
+        "python -m pip install --no-cache-dir torch==2.1.2 torchvision==0.16.2 torchaudio==2.1.2 --index-url https://download.pytorch.org/whl/cu121",
+        # Install flash-attn separately with options
+        "python -m pip install --no-cache-dir flash-attn==2.4.2 --no-build-isolation",
+    )
+    # Now install remaining packages
     .pip_install(
-        "pip==23.3.2",
-        "setuptools==69.0.3",
-        "wheel==0.42.0",
-        "pyarrow==15.0.0",      
-        # Core ML libraries
-        "torch==2.1.2",  # Latest stable that's well-tested with Whisper
-        "torchaudio==2.1.2",  # Matching torch version
-        "torchvision==0.16.2", # Add torchvision, compatible with torch 2.1.2
-        "transformers==4.51.3",  # Use latest
-        "accelerate==0.25.0",  # Latest stable
-        "wandb",  
-        # SpeechBrain and audio processing
-        "speechbrain==1.0.3",  # Latest stable
-        "librosa==0.10.1",  # Latest stable
-        # Hugging Face ecosystem
-        "datasets==2.16.1",  # Latest stable
-        "huggingface_hub==0.30.0",  # Latest stable
-        "sentencepiece==0.1.99",  # Latest stable
-        # Additional dependencies
+        "bitsandbytes==0.45.4",
+        "transformers==4.51.3",
+        "accelerate==0.25.0",
+        "wandb",
+        "speechbrain==1.0.3",
+        "librosa==0.10.1",
+        "datasets==2.16.1",
+        "huggingface_hub==0.30.0",
+        "sentencepiece==0.1.99",
         "num2words==0.5.13",
         "pyyaml==6.0.1",
         "tqdm==4.66.1",
         "pandas==2.1.4",
         "soundfile==0.12.1",
-        "flash-attn==2.4.2",          # fused attention kernels
-        "bitsandbytes==0.45.4",   
+        "pyarrow==15.0.0",
     )
     # Download noise & RIR WAVs during image build, you will want to change this to increase the number of files 
     .run_commands(
@@ -146,7 +166,7 @@ modal_image = (
 
 print("Modal App basics defined (using modal.Volume.from_name).")
 # End of Cell 1
- 
+
 # Ensure persistent Hugging Face cache inside the volume
 CHECKPOINT_DIR = "/root/checkpoints"  # Mount point inside container (defined above)
 CACHE_DIR = f"{CHECKPOINT_DIR}/hf_cache"  # Persistent HF cache stored in Modal volume
@@ -249,7 +269,7 @@ hparams = {
     "seed": 1986,
     "epochs": 10,
     "learning_rate": 1e-5, # Probably a bit high, need to decrease
-    "optimizer_type": "AdamW", # Added for tracking
+    "optimizer_type": "AdamW8bit", # Added for tracking
     "scheduler_type": "NewBob", # Added for tracking
     "lr_improvement_threshold": 0.0025, # Default for NewBobScheduler 
     "lr_patient": 0, # Default for NewBobScheduler 
@@ -267,12 +287,16 @@ hparams = {
     # Checkpointing
     "ckpt_interval_minutes": 30,
     "num_checkpoints_to_keep": 2,
+    
+    # AMP Params
+    "auto_mix_precision": True,
+    "amp_dtype": "bfloat16", # Use bfloat16 for AMP
 
     # Whisper decoding params
     "num_beams": 5,
 
     # === W&B Configuration ===
-    "use_wandb": False,  # Flag to enable/disable weights and biases
+    "use_wandb": True,  # Flag to enable/disable weights and biases
     "wandb_project": "whisper-large-egyptian-arabic",  # Placeholder : Project name on weights and biases 
     "wandb_entity": None,  # Placeholder - Optional: Your W&B username or team name
     "wandb_log_batch_freq": 100,  # Log batch metrics every N steps
@@ -342,9 +366,7 @@ print("Data Loading Pipelines defined.")
 
 # Cell 4: Define Brain Subclass 
 
-import speechbrain as sb
 from speechbrain.utils.metric_stats import ErrorRateStats
-from speechbrain.dataio.batch import PaddedBatch
 # Consolidated imports
 from speechbrain.augment.time_domain import (
     SpeedPerturb, AddNoise, AddReverb, DropChunk, DropFreq,
@@ -353,14 +375,7 @@ from speechbrain.augment.time_domain import (
 from speechbrain.augment.codec import CodecAugment 
 from speechbrain.augment.augmenter import Augmenter
 import os
-import string
-import torch
 import torch.nn.utils.rnn as rnn_utils
-import math
-import uuid # Needed for noise file naming
-import soundfile as sf # Needed for writing noise files
-import csv # Needed for writing noise manifest
-import torchaudio # Needed for resampling noise
 
 # --- Wrapper Augmentation Modules ---
 
@@ -484,13 +499,20 @@ class WhisperFineTuneBrain(sb.Brain):
 
         super().__init__(modules, opt_class, hparams, run_opts, checkpointer)
         
+        # Add a get method to self.hparams if it's a SimpleNamespace
+        if hasattr(self.hparams, '__dict__') and not hasattr(self.hparams, 'get'):
+            # Add a get method to SimpleNamespace
+            self.hparams.get = lambda key, default=None: safe_hparams_get(self.hparams, key, default)
+        
         try:
-            self.tokenizer = self.modules.whisper.tokenizer
+            self.tokenizer = None  # Will be set after Brain initialization
+            self.feature_extractor = None  # Will be set after Brain initialization
+
             # Access hparams using getattr for safety after super init
             self.sot_index = getattr(self.hparams, "sot_index", 50258)  # Start of transcript token
             self.eos_index = getattr(self.hparams, "eos_index", 50257)  # End of text token
-            self.pad_token_id = getattr(self.hparams, "pad_token_id", self.tokenizer.pad_token_id)
-            self.decoder_start_ids = getattr(self.hparams, "decoder_start_ids", [self.sot_index])
+            self.pad_token_id = getattr(self.hparams, "pad_token_id", None)  # Will be set when tokenizer is available
+            self.decoder_start_ids = getattr(self.hparams, "decoder_start_ids", None)  # Will be set when tokenizer is available
             
             # Verify token IDs match tokenizer
             if self.tokenizer:
@@ -583,9 +605,9 @@ class WhisperFineTuneBrain(sb.Brain):
                             )
                             sb_augmentations.append(noise_adder)
                             initialized_augmentations.append("AddNoise")
-                            logging.info(f"Successfully initialized AddNoise with dynamically created manifest (using full paths).")
+                            logging.info("Successfully initialized AddNoise with dynamically created manifest (using full paths).")
                         else:
-                             logging.warning(f"Dynamically created noise manifest is empty or header-only. Skipping AddNoise initialization.")
+                             logging.warning("Dynamically created noise manifest is empty or header-only. Skipping AddNoise initialization.")
                              noise_manifest_path = None # Invalidate the path
 
 
@@ -747,7 +769,7 @@ class WhisperFineTuneBrain(sb.Brain):
                     codec_augmenter.available_format_encoders = [("g722", None)]
                     sb_augmentations.append(codec_augmenter)
                     initialized_augmentations.append("CodecAugment (g722 forced)")
-                    logging.info(f"Initialized CodecAugment and forced g722 codec.")
+                    logging.info("Initialized CodecAugment and forced g722 codec.")
                 except Exception as e:
                     logging.warning(f"Could not initialize CodecAugment: {e}. Skipping.", exc_info=True)
 
@@ -855,6 +877,9 @@ class WhisperFineTuneBrain(sb.Brain):
             logging.debug(f"Batch Augmentations Applied (Predicted): {applied_augs_list if augmentation_applied_this_batch else 'None'}")
 
             try:
+                if self.tokenizer is None:
+                    raise ValueError("Tokenizer is not initialized. Make sure processor was properly set.")
+                    
                 tokens_list = [self.tokenizer.encode(t) for t in texts]
                 if any(not t for t in texts): logging.warning(f"Empty text found in batch: {texts}.")
                 if any(not tk for tk in tokens_list): logging.warning(f"Empty token list after encoding: {texts} -> {tokens_list}.")
@@ -896,19 +921,89 @@ class WhisperFineTuneBrain(sb.Brain):
             tokens_eos = (tokens_eos_padded, tokens_eos_lens_rel)
             tokens = (tokens_padded, tokens_lens_rel) # For metrics reference
 
-            # Return the potentially augmented wavs and their corresponding lengths
-            return wavs.to(self.device), wav_lens.to(self.device), tokens_bos, tokens_eos, tokens, texts
+            # Process audio wavs with feature_extractor
+            # Ensure wavs are on CPU if feature_extractor requires numpy (typical for some versions)
+            # Modern HF feature extractors can handle tensors. For safety and broader compatibility:
+            # Convert BFloat16/Float16 to Float32 before converting to numpy.... I tried to make HF Extractor handle tensors directly but it failed.... we'll see later on... room for imporvement here 
+            list_of_wav_arrays = [wav.cpu().float().numpy() for wav in torch.unbind(wavs, dim=0)]
+            
+            if self.feature_extractor is None:
+                raise ValueError("Feature extractor is not initialized. Make sure processor was properly set.")
+                
+            try:
+                # Process the audio with these settings
+                processed_audio = self.feature_extractor(
+                    list_of_wav_arrays,
+                    sampling_rate=hparams["target_sample_rate"], # This should be 16000 for Whisper Models 
+                    return_tensors="pt",
+                    padding="max_length",  # Ensure padding to max length
+                    truncation=True,        # Truncate if longer
+                    return_attention_mask=True 
+                )
+                
+                # Verify the shape of the processed features matches what Whisper expects
+                expected_shape = (128, 3000)
+                if processed_audio.input_features.shape[1:] != expected_shape:
+                    logging.warning(f"Feature extractor returned unexpected shape: {processed_audio.input_features.shape}, reshaping to [B, 128, 3000]")
+                    B = processed_audio.input_features.shape[0]
+                    
+                    # Create correctly shaped tensor and fill with available data
+                    correct_features = torch.zeros((B, 128, 3000), device=processed_audio.input_features.device)
+                    
+                    # If feature dimensions are wrong, we need to handle this specially
+                    if processed_audio.input_features.shape[1] != 128:
+                        # Take the first 128 features or pad if fewer
+                        src_features = min(128, processed_audio.input_features.shape[1])
+                        correct_features[:, :src_features, :min(3000, processed_audio.input_features.shape[2])] = \
+                            processed_audio.input_features[:, :src_features, :min(3000, processed_audio.input_features.shape[2])]
+                    else:
+                        # Just handle time dimension
+                        correct_features[:, :, :min(3000, processed_audio.input_features.shape[2])] = \
+                            processed_audio.input_features[:, :, :min(3000, processed_audio.input_features.shape[2])]
+                    
+                    processed_audio.input_features = correct_features
+                    
+                    # Also ensure attention mask is correct length if it exists
+                    if hasattr(processed_audio, "attention_mask"):
+                        att_mask = processed_audio.attention_mask
+                        correct_mask = torch.ones((B, 3000), dtype=att_mask.dtype, device=att_mask.device)
+                        if att_mask.shape[1] < 3000:
+                            correct_mask[:, :att_mask.shape[1]] = att_mask
+                        else:
+                            correct_mask = att_mask[:, :3000]
+                        processed_audio.attention_mask = correct_mask
+            except Exception as proc_e:
+                logging.error(f"Error during feature extraction: {proc_e}. Will attempt to continue.", exc_info=True)
+                # Try to recover with a minimal processed_audio object if extraction fails
+                B = len(list_of_wav_arrays)
+                processed_audio = type('', (), {})()  # Create an empty object
+                processed_audio.input_features = torch.zeros((B, 128, 3000), device=self.device)  # [B, 128, 3000] - standard Whisper mel features
+                processed_audio.attention_mask = torch.ones((B, 3000), device=self.device)  # [B, 3000]
+            
+            # Get model dtype to ensure inputs match model precision
+            model_dtype = next(self.modules.whisper.parameters()).dtype
+            
+            # Convert input features to the same dtype as the model
+            input_features = processed_audio.input_features.to(self.device).to(model_dtype)
+            if "attention_mask" in processed_audio:
+                encoder_attention_mask = processed_audio.attention_mask.to(self.device)
+            else:
+                encoder_attention_mask = None
+
+            # Return the processed input_features, encoder_attention_mask, and token data
+            return input_features, encoder_attention_mask, tokens_bos, tokens_eos, tokens, texts
 
         except Exception as e:
             logging.error(f"Critical Error in _preprocess_batch: {e}", exc_info=True)
             # Attempt to return dummy data matching expected types
             bsz = batch.batch_size if hasattr(batch, 'batch_size') else 1
-            dummy_wavs = torch.zeros((bsz, 1), device=self.device)
-            dummy_lens = torch.zeros(bsz, device=self.device)
+            # Whisper expects [batch_size, 128, 3000] mel spectrogram features
+            dummy_features = torch.zeros((bsz, 128, 3000), device=self.device) # Correct shape: [batch_size, 128, 3000]
+            dummy_mask = torch.ones((bsz, 3000), device=self.device, dtype=torch.long) # Correct shape: [batch_size, 3000]
             dummy_tokens = torch.full((bsz, 1), self.pad_token_id, dtype=torch.long, device=self.device)
             dummy_tok_lens = torch.zeros(bsz, device=self.device, dtype=torch.float)
             dummy_texts = ["preprocessing_error"] * bsz
-            return (dummy_wavs, dummy_lens,
+            return (dummy_features, dummy_mask,
                     (dummy_tokens, dummy_tok_lens), (dummy_tokens, dummy_tok_lens),
                     (dummy_tokens, dummy_tok_lens), dummy_texts)
 
@@ -918,22 +1013,29 @@ class WhisperFineTuneBrain(sb.Brain):
         """Runs preprocessing and the Whisper model forward pass."""
         try:
             # Call preprocess ONCE and get all required outputs
-            wavs, wav_lens, tokens_bos_data, tokens_eos_data, tokens_data, texts = self._preprocess_batch(batch, stage)
+            # Wavs and wav_lens are replaced by input_features and encoder_attention_mask
+            input_features, encoder_attention_mask, tokens_bos_data, tokens_eos_data, tokens_data, texts = self._preprocess_batch(batch, stage)
             tokens_bos, _ = tokens_bos_data # Unpack for model input
 
-            if wavs is None or tokens_bos is None or wavs.numel() == 0 or tokens_bos.numel() == 0:
+            if input_features is None or tokens_bos is None or input_features.numel() == 0 or tokens_bos.numel() == 0:
                  logging.error("Empty/None tensors from preprocessing in compute_forward.")
                  bsz = batch.batch_size if hasattr(batch, 'batch_size') else 1
                  dummy_log_probs = torch.zeros((bsz, 1, self.tokenizer.vocab_size), device=self.device)
-                 dummy_wav_lens = torch.zeros(bsz, device=self.device)
                  # Return dummy data matching the NEW expected structure
                  dummy_tokens = torch.full((bsz, 1), self.pad_token_id, dtype=torch.long, device=self.device)
                  dummy_tok_lens = torch.zeros(bsz, device=self.device, dtype=torch.float)
                  dummy_texts = ["preprocessing_error"] * bsz
-                 return (dummy_log_probs, None, dummy_wav_lens,
+                 return (dummy_log_probs, None, 
                          (dummy_tokens, dummy_tok_lens), (dummy_tokens, dummy_tok_lens), dummy_texts)
 
-            enc_out, logits, hyps = self.modules.whisper(wavs, tokens_bos)
+            # Model forward pass with input_features and attention_mask
+            outputs = self.modules.whisper(
+                input_features=input_features,
+                decoder_input_ids=tokens_bos,
+                attention_mask=encoder_attention_mask # Pass attention mask for encoder
+            )
+            logits = outputs.logits
+
 
             # Directly compute log_softmax
             log_probs = torch.nn.functional.log_softmax(logits, dim=-1)
@@ -952,20 +1054,17 @@ class WhisperFineTuneBrain(sb.Brain):
                 except Exception as dec_e:
                     logging.error(f"Error during greedy decoding: {dec_e}")
                     hyps_out = None
-
-            # Return model outputs AND the target info from the single preprocess call
-            return log_probs, hyps_out, wav_lens.to(self.device), tokens_eos_data, tokens_data, texts
+            return log_probs, hyps_out, tokens_eos_data, tokens_data, texts
 
         except Exception as e:
              logging.error(f"Error in compute_forward: {e}", exc_info=True)
              bsz = batch.batch_size if hasattr(batch, 'batch_size') else 1
              dummy_log_probs = torch.zeros((bsz, 1, self.tokenizer.vocab_size), device=self.device)
-             dummy_wav_lens = torch.zeros(bsz, device=self.device)
              # Return dummy data matching the NEW expected structure
              dummy_tokens = torch.full((bsz, 1), self.pad_token_id, dtype=torch.long, device=self.device)
              dummy_tok_lens = torch.zeros(bsz, device=self.device, dtype=torch.float)
              dummy_texts = ["preprocessing_error"] * bsz
-             return (dummy_log_probs, None, dummy_wav_lens,
+             return (dummy_log_probs, None, 
                      (dummy_tokens, dummy_tok_lens), (dummy_tokens, dummy_tok_lens), dummy_texts)
 
 
@@ -973,8 +1072,8 @@ class WhisperFineTuneBrain(sb.Brain):
     def compute_objectives(self, predictions, batch, stage):
         """Computes the loss and evaluation metrics."""
         try:
-            # Unpack predictions from compute_forward (now includes targets)
-            log_probs, hyps, wav_lens, tokens_eos_data, tokens_data, target_words_raw = predictions
+            # Unpack predictions from compute_forward (now includes targets, wav_lens removed)
+            log_probs, hyps, tokens_eos_data, tokens_data, target_words_raw = predictions
 
             if log_probs is None or not torch.all(torch.isfinite(log_probs)):
                  logging.error("Invalid log_probs (None, NaN/Inf) in compute_objectives. Returning zero loss.")
@@ -1194,11 +1293,40 @@ class WhisperFineTuneBrain(sb.Brain):
     def on_fit_start(self):
         try:
             super().on_fit_start()
+            # Now we can update these from the processor that was attached post-initialization
+            if hasattr(self, 'processor'):
+                self.tokenizer = self.processor.tokenizer
+                self.feature_extractor = self.processor.feature_extractor
+                
+                # Update pad_token_id and decoder_start_ids if needed
+                if self.pad_token_id is None:
+                    self.pad_token_id = self.tokenizer.pad_token_id
+                if self.decoder_start_ids is None:
+                    self.decoder_start_ids = [self.sot_index]
+                
+                # Verify token IDs match tokenizer
+                if self.tokenizer:
+                    # Convert special tokens to IDs for verification
+                    sot_id = self.tokenizer.convert_tokens_to_ids("<|startoftranscript|>")
+                    if self.sot_index != sot_id:
+                        logging.warning(f"SOT index mismatch: hparams={self.sot_index}, tokenizer={sot_id}")
+                    if self.eos_index != self.tokenizer.eos_token_id:
+                        logging.warning(f"EOS index mismatch: hparams={self.eos_index}, tokenizer={self.tokenizer.eos_token_id}")
+                    if self.pad_token_id != self.tokenizer.pad_token_id:
+                        logging.warning(f"PAD token mismatch: hparams={self.pad_token_id}, tokenizer={self.tokenizer.pad_token_id}")
+                    
+                    # Verify decoder start sequence
+                    if len(self.decoder_start_ids) < 3:  # Should at least have [SOT, lang, task]
+                        logging.warning(f"Decoder start sequence might be incomplete: {self.decoder_start_ids}")
+            else:
+                logging.warning("No processor found. Tokenizer and feature_extractor will be None.")
+            
             self.avg_train_loss = 0.0 # Still needed for on_train_epoch_end
             self._train_loss_buffer = []
             self._current_epoch_train_loss = 0.0 # Initialize the new variable
             logging.info("Fit started, initialized train loss tracking.")
-        except Exception as e: logging.error(f"Error in on_fit_start: {e}")
+        except Exception as e: 
+            logging.error(f"Error in on_fit_start: {e}", exc_info=True)
 
 
     # --- fit_batch (Extreme Gradient Stabilization) ---
@@ -1227,8 +1355,27 @@ class WhisperFineTuneBrain(sb.Brain):
                 param_group['lr'] = base_lr * warmup_factor
 
         try:
-            outputs = self.compute_forward(batch, sb.Stage.TRAIN)
-            loss = self.compute_objectives(outputs, batch, sb.Stage.TRAIN)
+            use_amp = getattr(self.hparams, "auto_mix_precision", False)
+            amp_dtype_str = getattr(self.hparams, "amp_dtype", "float16") # Default to float16 if not specified
+            
+            # Determine torch dtype for autocast
+            if amp_dtype_str == "bfloat16":
+                amp_torch_dtype = torch.bfloat16
+            elif amp_dtype_str == "float16":
+                amp_torch_dtype = torch.float16
+            else: # Default or unknown
+                amp_torch_dtype = torch.float16 
+                if use_amp: # Log if using default due to unknown string
+                    logging.warning(f"Unknown amp_dtype '{amp_dtype_str}', defaulting to float16 for autocast.")
+
+            if use_amp:
+                with torch.cuda.amp.autocast(dtype=amp_torch_dtype):
+                    outputs = self.compute_forward(batch, sb.Stage.TRAIN)
+                    loss = self.compute_objectives(outputs, batch, sb.Stage.TRAIN)
+            else:
+                outputs = self.compute_forward(batch, sb.Stage.TRAIN)
+                loss = self.compute_objectives(outputs, batch, sb.Stage.TRAIN)
+            
             batch_loss_value = loss.detach().item()  # Get value for logging
 
             # --- Loss Handling & Backward ---
@@ -1519,24 +1666,29 @@ def train_whisper_on_modal():
             logging.info(f"SpeechBrain version: {sb.__version__}")
 
             logging.info("Importing datasets...")
-            from datasets import load_dataset, DatasetDict, Audio, concatenate_datasets
+            from datasets import load_dataset
             logging.info("Datasets library imported successfully")
 
             logging.info("Importing SpeechBrain components...")
             from speechbrain.dataio.dataset import DynamicItemDataset
-            from speechbrain.dataio.dataloader import SaveableDataLoader
             from speechbrain.dataio.batch import PaddedBatch
             from speechbrain.dataio.sampler import DynamicBatchSampler
-            from speechbrain.utils.distributed import run_on_main, ddp_init_group
             # Revert logger import to only FileTrainLogger
             from speechbrain.utils.train_logger import FileTrainLogger 
-            from speechbrain.lobes.models.huggingface_transformers.whisper import Whisper
+            # from speechbrain.lobes.models.huggingface_transformers.whisper import Whisper # Old import
+            from transformers import AutoModelForSpeechSeq2Seq, WhisperProcessor # New imports
             logging.info("SpeechBrain components imported successfully")
 
             logging.info("Importing optimization libraries...")
             import torch.optim as optim
-            import pandas as pd
             import math
+            # Import bitsandbytes only inside the Modal function
+            try:
+                from bitsandbytes.optim import AdamW8bit
+                logging.info("Successfully imported AdamW8bit from bitsandbytes")
+            except ImportError:
+                logging.warning("Could not import bitsandbytes.optim.AdamW8bit, will use standard AdamW")
+                AdamW8bit = None
             logging.info("Optimization libraries imported successfully")
 
             logging.info("All imports completed successfully")
@@ -1610,11 +1762,32 @@ def train_whisper_on_modal():
         whisper_model = modules = optimizer = lr_scheduler = None
         try:
             logging.info("Initializing model, optimizer, scheduler...")
-            whisper_model = Whisper(
-                source=hparams.get("whisper_hub"), save_path=save_folder, encoder_only=False,
-                language=hparams.get("language"), task=hparams.get("task")
+            
+            # Load Processor
+            processor = WhisperProcessor.from_pretrained(
+                hparams.get("whisper_hub"),
+                cache_dir=CACHE_DIR # Use persistent cache
             )
+            
+            # Configuration of n_fft, hop_length, n_mels removed to use defaults from pretrained model
+            logging.info(f"Using default feature extractor configuration from {hparams.get('whisper_hub')}")
+            
+            # Load Model with Flash Attention 2 and BF16
+            whisper_model = AutoModelForSpeechSeq2Seq.from_pretrained(
+                hparams.get("whisper_hub"),
+                torch_dtype=torch.bfloat16,          # BF16 weights
+                low_cpu_mem_usage=True,              # Efficient loading
+                use_safetensors=True,                # Safer and often faster
+                attn_implementation="flash_attention_2", # Updated parameter name (was use_flash_attention_2)
+                cache_dir=CACHE_DIR                  # Use persistent cache
+            )
+            
+            # Move model to GPU immediately to ensure Flash Attention initializes correctly
+            whisper_model = whisper_model.to("cuda")
+            
+            # Only put the whisper_model in modules - processor is NOT a torch.nn.Module!
             modules = {"whisper": whisper_model}
+            
             no_decay = ['bias', 'LayerNorm.weight', 'layer_norm.weight']
             params = [
                 {'params': [p for n, p in modules["whisper"].named_parameters() if p.requires_grad and not any(nd in n for nd in no_decay)],
@@ -1622,13 +1795,29 @@ def train_whisper_on_modal():
                 {'params': [p for n, p in modules["whisper"].named_parameters() if p.requires_grad and any(nd in n for nd in no_decay)],
                  'weight_decay': 0.0, 'lr': hparams.get("learning_rate", 1e-7)}
             ]
-            optimizer = optim.AdamW(
-                params=params,
-                lr=hparams.get("learning_rate", 1e-7),
-                betas=(0.9, 0.999),
-                eps=1e-8,
-                weight_decay=hparams.get("weight_decay", 0.05)
-            )
+            
+            # Check if AdamW8bit is available and should be used from hparams
+            if hparams.get("optimizer_type", "AdamW") == "AdamW8bit" and 'AdamW8bit' in locals() and AdamW8bit is not None:
+                logging.info("Using AdamW8bit optimizer.")
+                optimizer = AdamW8bit( 
+                    params=params,                  
+                    lr=hparams.get("learning_rate", 1e-7), # Ensure LR is fetched
+                    betas=(0.9, 0.999), # Default betas
+                    eps=1e-8, # Default eps
+                    weight_decay=hparams.get("weight_decay", 0.05), # Ensure WD is fetched
+                )
+            else:
+                if hparams.get("optimizer_type", "AdamW") == "AdamW8bit":
+                    logging.warning("AdamW8bit was requested but is not available. Falling back to regular AdamW.")
+                logging.info("Using AdamW optimizer.")
+                optimizer = optim.AdamW(
+                    params=params,
+                    lr=hparams.get("learning_rate", 1e-7),
+                    betas=(0.9, 0.999),
+                    eps=1e-8,
+                    weight_decay=hparams.get("weight_decay", 0.05)
+                )
+
             lr_scheduler = sb.nnet.schedulers.NewBobScheduler(
                 initial_value=hparams.get("learning_rate"), improvement_threshold=hparams.get("lr_improvement_threshold", 0.0025),
                 annealing_factor=hparams.get("lr_annealing_factor"), patient=hparams.get("lr_patient", 0)
@@ -1673,7 +1862,7 @@ def train_whisper_on_modal():
                     logging.info(f"Successfully created DynamicItemDataset for split: {split} with {len(datasets_dict[split])} items.")
                 else:
                      logging.warning(f"Split '{split}' not found in loaded dataset. Skipping.")
-            if not hparams.get("train_split") in datasets_dict or not hparams.get("valid_split") in datasets_dict:
+            if hparams.get("train_split") not in datasets_dict or hparams.get("valid_split") not in datasets_dict:
                  logging.error("Essential train or validation dataset could not be created. Exiting.")
                  return
         except Exception as e:
@@ -1767,6 +1956,8 @@ def train_whisper_on_modal():
                 run_opts=run_opts, checkpointer=checkpointer
             )
             logging.info(f"WhisperFineTuneBrain initialized on device: {whisper_brain.device}")
+            # Add processor to the brain object but outside the modules dict
+            whisper_brain.processor = processor
         except Exception as e: logging.error(f"Error initializing WhisperFineTuneBrain: {e}", exc_info=True); return
 
         # --- WandB Watch Model (If enabled and wandb initialized) ---
