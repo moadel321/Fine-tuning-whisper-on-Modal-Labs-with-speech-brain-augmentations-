@@ -92,54 +92,45 @@ wandb_secret = modal.Secret.from_name("wandb-secret") # Define the wandb secret 
 
 # --- Persistent Storage ---
 volume = modal.Volume.from_name(
-    "fine-tune-whisper-large-egyptian-arabic", create_if_missing=True # Placeholder : name your volume here 
+    "fine-tune-whisper-large-egyptian-arabic-optimization-experiment", create_if_missing=True # Placeholder : name your volume here 
 )
 CACHE_DIR = "/cache" # HF cache inside container
 CHECKPOINT_DIR = "/root/checkpoints" # Mount point inside container
 
 # --- Environment Image Definition ---
 modal_image = (
-    modal.Image.debian_slim(python_version="3.10")
+    modal.Image.from_registry("pytorch/pytorch:2.1.2-cuda12.1-cudnn8-devel") # Changed to -devel image
+    .env({"DEBIAN_FRONTEND": "noninteractive"})
     .apt_install(
         "build-essential", "cmake", "libboost-all-dev",
         "libeigen3-dev", "git", "libsndfile1", "ffmpeg",
-        "wget" 
+        "wget", "tzdata"
     )
     .pip_install(
         "pip==23.3.2",
         "setuptools==69.0.3",
         "wheel==0.42.0",
-        "pyarrow==15.0.0",      
-        # Core ML libraries
-        "torch==2.1.2",  # Latest stable that's well-tested with Whisper
-        "torchaudio==2.1.2",  # Matching torch version
-        "torchvision==0.16.2", # Add torchvision, compatible with torch 2.1.2
-        "transformers==4.51.3",  # Use latest
-        "accelerate==0.25.0",  # Latest stable
-        "wandb",  
-        # SpeechBrain and audio processing
-        "speechbrain==1.0.3",  # Latest stable
-        "librosa==0.10.1",  # Latest stable
-        # Hugging Face ecosystem
-        "datasets==2.16.1",  # Latest stable
-        "huggingface_hub==0.30.0",  # Latest stable
-        "sentencepiece==0.1.99",  # Latest stable
-        # Additional dependencies
+        "pyarrow==15.0.0",
+        "transformers==4.51.3",
+        "accelerate==0.25.0",
+        "wandb",
+        "speechbrain==1.0.3",
+        "librosa==0.10.1",
+        "datasets==2.16.1",
+        "huggingface_hub==0.30.0",
+        "sentencepiece==0.1.99",
         "num2words==0.5.13",
         "pyyaml==6.0.1",
         "tqdm==4.66.1",
         "pandas==2.1.4",
         "soundfile==0.12.1",
-        "flash-attn==2.4.2",          # fused attention kernels
-        "bitsandbytes==0.45.4",   
+        "flash-attn==2.4.2",
+        "bitsandbytes==0.45.4",
     )
-    # Download noise & RIR WAVs during image build, you will want to change this to increase the number of files 
     .run_commands(
-        "mkdir -p /noise_assets /rir_assets", # Create both directories
-        # Noise files
+        "mkdir -p /noise_assets /rir_assets",
         "wget https://www.dropbox.com/s/aleer424jumcs08/noise2.wav -O /noise_assets/noise2.wav",
         "wget https://www.dropbox.com/s/eoxxi2ezr8owk8a/noise3.wav -O /noise_assets/noise3.wav",
-        # RIR file
         "wget https://www.dropbox.com/s/pjnub2s5hql2vxs/rir1.wav -O /rir_assets/rir1.wav"
     )
 )
@@ -247,7 +238,7 @@ hparams = {
 
     # Training Params
     "seed": 1986,
-    "epochs": 10,
+    "epochs": 1,
     "learning_rate": 1e-5, # Probably a bit high, need to decrease
     "optimizer_type": "AdamW", # Added for tracking
     "scheduler_type": "NewBob", # Added for tracking
@@ -272,7 +263,7 @@ hparams = {
     "num_beams": 5,
 
     # === W&B Configuration ===
-    "use_wandb": False,  # Flag to enable/disable weights and biases
+    "use_wandb": True,  # Flag to enable/disable weights and biases
     "wandb_project": "whisper-large-egyptian-arabic",  # Placeholder : Project name on weights and biases 
     "wandb_entity": None,  # Placeholder - Optional: Your W&B username or team name
     "wandb_log_batch_freq": 100,  # Log batch metrics every N steps
@@ -1450,7 +1441,8 @@ logging.info("Defining Modal training function...")
     volumes={CHECKPOINT_DIR: volume},
     secrets=[hf_secret, wandb_secret],
     timeout=6 * 60 * 60,
-    scaledown_window=30*60
+    scaledown_window=30*60,
+    max_containers=1
 )
 def train_whisper_on_modal():
     global hparams 
@@ -1471,7 +1463,7 @@ def train_whisper_on_modal():
                  logging.warning("WANDB_API_KEY environment variable NOT found. W&B initialization might fail.")
 
             # Use standard string formatting to avoid f-string quote issues
-            project_name = getattr(hparams, "wandb_project", "whisper-medium-egyptian-arabic") # Placeholder : Change this to your project's name on weights and biases
+            project_name = getattr(hparams, "wandb_project", "whisper-large-egyptian-arabic") # Placeholder : Change this to your project's name on weights and biases
             entity_name = hparams.get("wandb_entity", None) # Use .get()
             resume_id = hparams.get("wandb_resume_id", None) # Get the resume ID
 
@@ -1632,8 +1624,8 @@ def train_whisper_on_modal():
             logging.info("Initializing model, optimizer, scheduler...")
             whisper_model = Whisper(
                 source=hparams.get("whisper_hub"), save_path=save_folder, encoder_only=False,
-                language=hparams.get("language"), task=hparams.get("task"),
-                attn_implementation="flash_attention_2" # Add this line
+                language=hparams.get("language"), task=hparams.get("task")
+                # REMOVED: attn_implementation="flash_attention_2"
             )
 
             if hasattr(whisper_model, 'model'): # Check if the underlying HF model is accessible via 'model'
