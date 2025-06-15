@@ -4,9 +4,12 @@ import json
 import os
 import sys
 import random
+import glob
 import torch
 import torchaudio
 import soundfile as sf
+from pathlib import Path
+from typing import Optional, Tuple, Dict, Any
 
 # Turn off tokenizers parallelism warnings
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
@@ -129,6 +132,14 @@ hparams = {
     "use_wandb": True,
     "wandb_project": "nemo-arabic-asr",
     "wandb_entity": None,
+    
+    # Resume functionality
+    "auto_resume": True,              # Automatically resume from latest checkpoint if found
+    "force_restart": False,           # Force restart even if checkpoints exist
+    "resume_checkpoint_path": None,   # Specific checkpoint path to resume from
+    "skip_data_processing": True,     # Skip data processing if manifests exist
+    "validate_data_integrity": False, # Validate existing data files before skipping
+    "resume_strategy": "latest",      # "latest", "best", or "specific"
 }
 
 print("Hyperparameters defined.")
@@ -245,6 +256,208 @@ def process_split(dataset, audio_dir, text_normalizer=None, augment_fn=None):
             
     return data_list
 
+# Resume functionality utilities
+def find_latest_checkpoint(checkpoint_dir: str) -> Optional[str]:
+    """Find the most recent checkpoint file in the directory."""
+    if not os.path.exists(checkpoint_dir):
+        return None
+    
+    checkpoint_pattern = os.path.join(checkpoint_dir, "*.ckpt")
+    checkpoint_files = glob.glob(checkpoint_pattern)
+    
+    if not checkpoint_files:
+        return None
+    
+    # Sort by modification time, most recent first
+    checkpoint_files.sort(key=os.path.getmtime, reverse=True)
+    return checkpoint_files[0]
+
+def find_best_checkpoint(checkpoint_dir: str) -> Optional[str]:
+    """Find the best checkpoint based on validation metric."""
+    if not os.path.exists(checkpoint_dir):
+        return None
+    
+    # Look for best checkpoint (PyTorch Lightning saves this)
+    best_checkpoint = os.path.join(checkpoint_dir, "best.ckpt")
+    if os.path.exists(best_checkpoint):
+        return best_checkpoint
+    
+    # Fallback to latest if no best checkpoint found
+    return find_latest_checkpoint(checkpoint_dir)
+
+def validate_checkpoint_compatibility(checkpoint_path: str, current_config: dict) -> bool:
+    """Check if checkpoint is compatible with current configuration."""
+    try:
+        import torch
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        
+        # Basic validation - check if it's a valid PyTorch Lightning checkpoint
+        required_keys = ['epoch', 'global_step', 'state_dict']
+        for key in required_keys:
+            if key not in checkpoint:
+                logging.warning(f"Checkpoint missing required key: {key}")
+                return False
+        
+        return True
+    except Exception as e:
+        logging.error(f"Error validating checkpoint {checkpoint_path}: {e}")
+        return False
+
+def get_checkpoint_info(checkpoint_path: str) -> Dict[str, Any]:
+    """Extract metadata from checkpoint."""
+    try:
+        import torch
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        
+        info = {
+            'epoch': checkpoint.get('epoch', 0),
+            'global_step': checkpoint.get('global_step', 0),
+            'path': checkpoint_path,
+            'file_size': os.path.getsize(checkpoint_path),
+            'modified_time': os.path.getmtime(checkpoint_path)
+        }
+        
+        # Try to extract validation metrics if available
+        if 'callbacks' in checkpoint:
+            callbacks = checkpoint['callbacks']
+            for callback_name, callback_state in callbacks.items():
+                if 'best_model_score' in callback_state:
+                    info['best_score'] = callback_state['best_model_score']
+                    break
+        
+        return info
+    except Exception as e:
+        logging.error(f"Error getting checkpoint info from {checkpoint_path}: {e}")
+        return {'path': checkpoint_path, 'error': str(e)}
+
+def check_manifests_exist(manifest_dir: str) -> Dict[str, bool]:
+    """Check which manifest files exist."""
+    required_manifests = ['train_manifest.json', 'val_manifest.json', 'test_manifest.json']
+    manifest_status = {}
+    
+    for manifest_name in required_manifests:
+        manifest_path = os.path.join(manifest_dir, manifest_name)
+        manifest_status[manifest_name] = os.path.exists(manifest_path)
+    
+    return manifest_status
+
+def validate_manifest_integrity(manifest_path: str) -> bool:
+    """Check if manifest file is valid JSON with expected structure."""
+    try:
+        with open(manifest_path, 'r') as f:
+            line_count = 0
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # Parse each line as JSON
+                data = json.loads(line)
+                
+                # Check required fields
+                required_fields = ['audio_filepath', 'duration', 'text']
+                for field in required_fields:
+                    if field not in data:
+                        logging.warning(f"Manifest {manifest_path} missing field {field} in line {line_count + 1}")
+                        return False
+                
+                line_count += 1
+            
+            # Must have at least one entry
+            return line_count > 0
+            
+    except Exception as e:
+        logging.error(f"Error validating manifest {manifest_path}: {e}")
+        return False
+
+def check_audio_files_exist(manifest_path: str) -> Tuple[bool, int, int]:
+    """Check if audio files referenced in manifest exist. Returns (all_exist, found_count, total_count)."""
+    try:
+        found_count = 0
+        total_count = 0
+        
+        with open(manifest_path, 'r') as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                data = json.loads(line)
+                audio_path = data.get('audio_filepath')
+                
+                if audio_path:
+                    total_count += 1
+                    if os.path.exists(audio_path):
+                        found_count += 1
+        
+        all_exist = found_count == total_count
+        return all_exist, found_count, total_count
+        
+    except Exception as e:
+        logging.error(f"Error checking audio files for manifest {manifest_path}: {e}")
+        return False, 0, 0
+
+def should_skip_data_processing(output_folder: str, hparams: dict) -> bool:
+    """Determine if data processing should be skipped."""
+    if not hparams.get("skip_data_processing", False):
+        return False
+    
+    manifest_dir = os.path.join(output_folder, "manifests")
+    manifest_status = check_manifests_exist(manifest_dir)
+    
+    # All manifests must exist
+    if not all(manifest_status.values()):
+        missing = [name for name, exists in manifest_status.items() if not exists]
+        logging.info(f"Missing manifests: {missing}. Will process data.")
+        return False
+    
+    # Validate manifest integrity
+    for manifest_name, exists in manifest_status.items():
+        if exists:
+            manifest_path = os.path.join(manifest_dir, manifest_name)
+            if not validate_manifest_integrity(manifest_path):
+                logging.info(f"Invalid manifest: {manifest_name}. Will process data.")
+                return False
+    
+    # Optionally validate audio files exist
+    if hparams.get("validate_data_integrity", False):
+        for manifest_name in manifest_status.keys():
+            manifest_path = os.path.join(manifest_dir, manifest_name)
+            all_exist, found, total = check_audio_files_exist(manifest_path)
+            if not all_exist:
+                logging.info(f"Missing audio files for {manifest_name}: {found}/{total} found. Will process data.")
+                return False
+    
+    logging.info("All manifests exist and are valid. Skipping data processing.")
+    return True
+
+def validate_resume_setup(hparams: dict, resume_checkpoint_path: Optional[str], 
+                         skip_data_processing: bool) -> bool:
+    """Validate that resume setup is consistent and viable."""
+    try:
+        # Check for conflicting settings
+        if hparams["force_restart"] and resume_checkpoint_path:
+            logging.warning("force_restart=True but resume checkpoint found - this is expected")
+        
+        # If resuming, ensure we have valid manifests
+        if resume_checkpoint_path and skip_data_processing:
+            manifest_dir = os.path.join(hparams["output_folder"], "manifests")
+            manifest_status = check_manifests_exist(manifest_dir)
+            if not all(manifest_status.values()):
+                logging.error("Resume checkpoint found but manifests are missing!")
+                logging.error("This could cause training to fail. Consider setting skip_data_processing=False")
+                return False
+        
+        # Validate checkpoint directory exists
+        if not os.path.exists(hparams["save_folder"]):
+            logging.info(f"Checkpoint directory doesn't exist yet: {hparams['save_folder']}")
+        
+        return True
+        
+    except Exception as e:
+        logging.error(f"Error validating resume setup: {e}")
+        return False
+
 @app.function(
     image=modal_image,
     gpu="A100-80GB",
@@ -269,6 +482,71 @@ def train_nemo_arabic():
     # Setup directories
     os.makedirs(hparams["save_folder"], exist_ok=True)
     os.makedirs(hparams["output_folder"], exist_ok=True)
+    
+    # Resume detection logic
+    resume_checkpoint_path = None
+    skip_data_processing = False
+    
+    if not hparams["force_restart"] and hparams["auto_resume"]:
+        logging.info("Checking for existing checkpoints...")
+        
+        if hparams["resume_checkpoint_path"]:
+            # Specific checkpoint provided
+            if os.path.exists(hparams["resume_checkpoint_path"]):
+                if validate_checkpoint_compatibility(hparams["resume_checkpoint_path"], hparams):
+                    resume_checkpoint_path = hparams["resume_checkpoint_path"]
+                    logging.info(f"Will resume from specified checkpoint: {resume_checkpoint_path}")
+                else:
+                    logging.warning(f"Specified checkpoint is incompatible: {hparams['resume_checkpoint_path']}")
+            else:
+                logging.warning(f"Specified checkpoint not found: {hparams['resume_checkpoint_path']}")
+        else:
+            # Auto-detect checkpoint based on strategy
+            if hparams["resume_strategy"] == "best":
+                resume_checkpoint_path = find_best_checkpoint(hparams["save_folder"])
+            else:  # "latest" or fallback
+                resume_checkpoint_path = find_latest_checkpoint(hparams["save_folder"])
+            
+            if resume_checkpoint_path:
+                if validate_checkpoint_compatibility(resume_checkpoint_path, hparams):
+                    checkpoint_info = get_checkpoint_info(resume_checkpoint_path)
+                    logging.info(f"Found valid checkpoint: {resume_checkpoint_path}")
+                    logging.info(f"Checkpoint info: epoch={checkpoint_info.get('epoch', 'unknown')}, "
+                               f"step={checkpoint_info.get('global_step', 'unknown')}")
+                else:
+                    logging.warning(f"Found checkpoint but it's incompatible: {resume_checkpoint_path}")
+                    resume_checkpoint_path = None
+    
+    if hparams["force_restart"]:
+        logging.info("Force restart enabled - ignoring any existing checkpoints")
+        resume_checkpoint_path = None
+    
+    # Check if data processing should be skipped
+    skip_data_processing = should_skip_data_processing(hparams["output_folder"], hparams)
+    
+    # Log resume summary
+    logging.info("=" * 60)
+    logging.info("RESUME FUNCTIONALITY SUMMARY")
+    logging.info("=" * 60)
+    logging.info(f"Auto resume: {hparams['auto_resume']}")
+    logging.info(f"Force restart: {hparams['force_restart']}")
+    logging.info(f"Resume strategy: {hparams['resume_strategy']}")
+    logging.info(f"Skip data processing: {hparams['skip_data_processing']}")
+    
+    if resume_checkpoint_path:
+        logging.info(f"✓ RESUMING training from checkpoint: {resume_checkpoint_path}")
+    else:
+        logging.info("✓ STARTING fresh training")
+    
+    if skip_data_processing:
+        logging.info("✓ SKIPPING data processing - using existing manifests")
+    else:
+        logging.info("✓ PROCESSING data - creating new manifests")
+    logging.info("=" * 60)
+    
+    # Validate resume setup
+    if not validate_resume_setup(hparams, resume_checkpoint_path, skip_data_processing):
+        logging.warning("Resume setup validation failed - proceeding with caution")
     
     # Initialize W&B
     wandb_run = None
@@ -315,68 +593,89 @@ def train_nemo_arabic():
             
             logging.info(f"Debug dataset sizes: { {s: len(d) for s, d in raw_datasets.items()} }")
 
-        # Setup augmentations
-        augmenter = setup_augmentations() if hparams["augment"] else None
-        
-        def augment_and_save(audio_tensor, text, audio_dir, index, data_list):
-            """Applies augmentations and saves variants."""
-            for variant in range(hparams["num_augmented_variants"]):
-                augmented_audio = apply_augmentations(audio_tensor, augmenter)
-                variant_path = os.path.join(audio_dir, f"augmented_{index:06d}_v{variant}.wav")
-                sf.write(variant_path, augmented_audio.numpy(), TARGET_SAMPLE_RATE)
-                data_list.append({
-                    'audio_filepath': variant_path,
-                    'duration': len(augmented_audio) / TARGET_SAMPLE_RATE,
-                    'text': text
-                })
-
-        # Create audio directories
-        audio_base_dir = os.path.join(hparams["output_folder"], "audio")
-        train_audio_dir = os.path.join(audio_base_dir, "train")
-        val_audio_dir = os.path.join(audio_base_dir, "val")
-        test_audio_dir = os.path.join(audio_base_dir, "test")
-        
-        # Process datasets and create manifests
+        # Conditional data processing
         manifest_dir = os.path.join(hparams["output_folder"], "manifests")
-        os.makedirs(manifest_dir, exist_ok=True)
-        
-        # Process training data
-        logging.info("Processing training data...")
-        train_data = process_split(
-            raw_datasets[hparams["train_split"]],
-            train_audio_dir,
-            augment_fn=augment_and_save if hparams["augment"] and augmenter else None
-        )
         train_manifest = os.path.join(manifest_dir, "train_manifest.json")
-        create_nemo_manifest(train_data, train_manifest)
-        
-        # Process validation data (no augmentation)
-        logging.info("Processing validation data...")
-        val_data = process_split(
-            raw_datasets[hparams["valid_split"]],
-            val_audio_dir
-        )
         val_manifest = os.path.join(manifest_dir, "val_manifest.json")
-        create_nemo_manifest(val_data, val_manifest)
-        
-        # Process test data (no augmentation)
-        logging.info("Processing test data...")
-        test_data = process_split(
-            raw_datasets[hparams["test_split"]],
-            test_audio_dir
-        )
         test_manifest = os.path.join(manifest_dir, "test_manifest.json")
-        create_nemo_manifest(test_data, test_manifest)
+        
+        if not skip_data_processing:
+            # Setup augmentations
+            augmenter = setup_augmentations() if hparams["augment"] else None
+            
+            def augment_and_save(audio_tensor, text, audio_dir, index, data_list):
+                """Applies augmentations and saves variants."""
+                for variant in range(hparams["num_augmented_variants"]):
+                    augmented_audio = apply_augmentations(audio_tensor, augmenter)
+                    variant_path = os.path.join(audio_dir, f"augmented_{index:06d}_v{variant}.wav")
+                    sf.write(variant_path, augmented_audio.numpy(), TARGET_SAMPLE_RATE)
+                    data_list.append({
+                        'audio_filepath': variant_path,
+                        'duration': len(augmented_audio) / TARGET_SAMPLE_RATE,
+                        'text': text
+                    })
+
+            # Create audio directories
+            audio_base_dir = os.path.join(hparams["output_folder"], "audio")
+            train_audio_dir = os.path.join(audio_base_dir, "train")
+            val_audio_dir = os.path.join(audio_base_dir, "val")
+            test_audio_dir = os.path.join(audio_base_dir, "test")
+            
+            # Process datasets and create manifests
+            os.makedirs(manifest_dir, exist_ok=True)
+            
+            # Process training data
+            logging.info("Processing training data...")
+            train_data = process_split(
+                raw_datasets[hparams["train_split"]],
+                train_audio_dir,
+                augment_fn=augment_and_save if hparams["augment"] and augmenter else None
+            )
+            create_nemo_manifest(train_data, train_manifest)
+            
+            # Process validation data (no augmentation)
+            logging.info("Processing validation data...")
+            val_data = process_split(
+                raw_datasets[hparams["valid_split"]],
+                val_audio_dir
+            )
+            create_nemo_manifest(val_data, val_manifest)
+            
+            # Process test data (no augmentation)
+            logging.info("Processing test data...")
+            test_data = process_split(
+                raw_datasets[hparams["test_split"]],
+                test_audio_dir
+            )
+            create_nemo_manifest(test_data, test_manifest)
+        else:
+            logging.info("Using existing manifest files:")
+            logging.info(f"  Train: {train_manifest}")
+            logging.info(f"  Validation: {val_manifest}")
+            logging.info(f"  Test: {test_manifest}")
         
         # Load NeMo model
-        logging.info("Loading NeMo model...")
-        model = EncDecHybridRNNTCTCBPEModel.from_pretrained(hparams["nemo_model_name"])
+        if resume_checkpoint_path:
+            logging.info(f"Loading NeMo model from checkpoint: {resume_checkpoint_path}")
+            try:
+                model = EncDecHybridRNNTCTCBPEModel.restore_from(resume_checkpoint_path)
+                logging.info("Successfully loaded model from checkpoint")
+            except Exception as e:
+                logging.error(f"Failed to load model from checkpoint: {e}")
+                logging.info("Falling back to pretrained model")
+                model = EncDecHybridRNNTCTCBPEModel.from_pretrained(hparams["nemo_model_name"])
+                resume_checkpoint_path = None  # Reset since we're not actually resuming
+        else:
+            logging.info("Loading pretrained NeMo model...")
+            model = EncDecHybridRNNTCTCBPEModel.from_pretrained(hparams["nemo_model_name"])
         
         # Configure model for Arabic ASR and update paths
         with open_dict(model.cfg):
+            # Always ensure these critical settings are correct
             model.cfg.use_cer = True
             model.cfg.tokenizer.dir = hparams["save_folder"]
-            # Update dataset configs to prevent warnings
+            
+            # Update dataset configs (always update paths in case they changed)
             model.cfg.train_ds.manifest_filepath = train_manifest
             model.cfg.train_ds.is_tarred = False
             model.cfg.train_ds.batch_size = hparams['batch_size']
@@ -384,6 +683,9 @@ def train_nemo_arabic():
             model.cfg.validation_ds.batch_size = hparams['batch_size']
             model.cfg.test_ds.manifest_filepath = test_manifest
             model.cfg.test_ds.batch_size = hparams['batch_size']
+            
+            if resume_checkpoint_path:
+                logging.info("Model loaded from checkpoint - preserving existing configuration where appropriate")
         
         # Log model configuration
         logging.info(f"Model labels count: {len(model.cfg.labels)}")
@@ -403,6 +705,11 @@ def train_nemo_arabic():
             'logger': False,
             'enable_progress_bar': True,
         }
+        
+        # Add resume configuration if resuming
+        if resume_checkpoint_path:
+            trainer_config['resume_from_checkpoint'] = resume_checkpoint_path
+            logging.info(f"Trainer configured to resume from: {resume_checkpoint_path}")
         
         # Setup data configs as dictionaries (following NeMo tutorial pattern)
         logging.info("Setting up data loaders...")
@@ -493,8 +800,19 @@ def train_nemo_arabic():
         model.set_trainer(trainer)
         
         logging.info("Starting training...")
+        if resume_checkpoint_path:
+            logging.info(f"Resuming training from checkpoint: {resume_checkpoint_path}")
+        else:
+            logging.info("Starting fresh training")
+        
         # Use the model's trainer instead of calling trainer.fit directly
-        model.trainer.fit(model)
+        try:
+            model.trainer.fit(model)
+        except Exception as e:
+            if resume_checkpoint_path:
+                logging.error(f"Training failed with resume checkpoint: {e}")
+                logging.info("You may want to try force_restart=True to start fresh")
+            raise
         
         # Test model
         logging.info("Running final evaluation...")
