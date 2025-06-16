@@ -137,6 +137,7 @@ hparams = {
     "use_wandb": True,
     "wandb_project": "nemo-arabic-asr",
     "wandb_entity": None,
+    "wandb_resume_id": None,  # Set to specific run ID string to resume a W&B run
     
     # Additional metrics tracking
     "log_audio_samples": False,  # Log audio samples to W&B (can be large)
@@ -596,14 +597,29 @@ def train_nemo_arabic():
                 'scheduler_info': 'Will be updated after dataset processing'
             })
             
-            wandb_logger = WandbLogger(
-                project=hparams["wandb_project"],
-                entity=hparams["wandb_entity"],
-                name=f"nemo-arabic-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}",
-                config=wandb_config,
-                log_model='all',  # Log model checkpoints
-                save_dir=hparams["output_folder"]
-            )
+            # Handle W&B run resuming
+            wandb_logger_kwargs = {
+                "project": hparams["wandb_project"],
+                "entity": hparams["wandb_entity"],
+                "config": wandb_config,
+                "log_model": 'all',  # Log model checkpoints
+                "save_dir": hparams["output_folder"]
+            }
+            
+            # Check if we should resume an existing run
+            resume_id = hparams.get("wandb_resume_id")
+            if resume_id:
+                logging.info(f"Attempting to resume W&B run with ID: {resume_id}")
+                wandb_logger_kwargs.update({
+                    "id": resume_id,
+                    "resume": "must"  # Ensure it resumes or fails
+                })
+                # Don't set name when resuming - it will use the existing run's name
+            else:
+                logging.info("Starting a new W&B run")
+                wandb_logger_kwargs["name"] = f"nemo-arabic-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}"
+            
+            wandb_logger = WandbLogger(**wandb_logger_kwargs)
             # WandbLogger will automatically log:
             # - Training loss, validation loss
             # - WER (Word Error Rate), CER (Character Error Rate)  
