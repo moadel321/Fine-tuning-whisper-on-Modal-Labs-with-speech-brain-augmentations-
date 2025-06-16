@@ -117,21 +117,31 @@ hparams = {
     "drop_freq_count_high": 3,
     
     # Training
-    "debug_mode": True, # Flag for test runs on a small data subset
+    "debug_mode": None, # Flag for test runs on a small data subset
     "debug_num_samples": 1000, # Number of samples for debug mode
     "seed": 1986,
     "epochs": 10,
-    "learning_rate": 1e-4,
-    "weight_decay": 0.01,
+    "learning_rate": 2e-5,  # Reduced from 1e-4 for stable fine-tuning
+    "weight_decay": 0.005,  # Reduced from 0.01 for fine-tuning
     "batch_size": 8,
     "num_workers": 8,
     "grad_accumulation_factor": 4,
     "max_grad_norm": 5.0,
     
+    # Scheduler parameters
+    "scheduler_name": "CosineAnnealing",
+    "min_lr": 1e-6,
+    "warmup_ratio": 0.05,  # 5% warmup instead of 10%
+    
     # W&B
     "use_wandb": True,
     "wandb_project": "nemo-arabic-asr",
     "wandb_entity": None,
+    
+    # Additional metrics tracking
+    "log_audio_samples": False,  # Log audio samples to W&B (can be large)
+    "log_predictions": False,    # Log prediction examples
+    "log_system_metrics": True,  # Log GPU/CPU usage metrics
     
     # Resume functionality
     "auto_resume": True,              # Automatically resume from latest checkpoint if found
@@ -143,6 +153,21 @@ hparams = {
 }
 
 print("Hyperparameters defined.")
+
+# Scheduler Calculation Functions
+def calculate_scheduler_steps(dataset_size, batch_size, grad_accumulation, epochs, debug_mode=False):
+    """Calculate total steps and appropriate warmup steps for scheduler."""
+    effective_batch_size = batch_size * grad_accumulation
+    steps_per_epoch = max(1, dataset_size // effective_batch_size)
+    total_steps = steps_per_epoch * epochs
+    
+    # Dynamic warmup calculation based on mode
+    if debug_mode:
+        warmup_steps = min(50, total_steps // 10)  # Smaller for debug mode
+    else:
+        warmup_steps = min(500, int(total_steps * 0.05))  # 5% or 500 max
+    
+    return total_steps, warmup_steps, steps_per_epoch
 
 # Augmentation Functions
 def setup_augmentations():
@@ -448,6 +473,15 @@ def validate_resume_setup(hparams: dict, resume_checkpoint_path: Optional[str],
                 logging.error("This could cause training to fail. Consider setting skip_data_processing=False")
                 return False
         
+        # Validate scheduler parameters
+        if hparams.get("learning_rate", 0) <= 0:
+            logging.error(f"Invalid learning rate: {hparams.get('learning_rate')}")
+            return False
+        
+        if hparams.get("min_lr", 0) >= hparams.get("learning_rate", 1e-4):
+            logging.error(f"min_lr ({hparams.get('min_lr')}) should be less than learning_rate ({hparams.get('learning_rate')})")
+            return False
+        
         # Validate checkpoint directory exists
         if not os.path.exists(hparams["save_folder"]):
             logging.info(f"Checkpoint directory doesn't exist yet: {hparams['save_folder']}")
@@ -460,7 +494,7 @@ def validate_resume_setup(hparams: dict, resume_checkpoint_path: Optional[str],
 
 @app.function(
     image=modal_image,
-    gpu="A100-80GB",
+    gpu="A100-40GB",
     cpu=8,
     volumes={CHECKPOINT_DIR: volume},
     secrets=[hf_secret, wandb_secret],
@@ -548,21 +582,38 @@ def train_nemo_arabic():
     if not validate_resume_setup(hparams, resume_checkpoint_path, skip_data_processing):
         logging.warning("Resume setup validation failed - proceeding with caution")
     
-    # Initialize W&B
-    wandb_run = None
+    # Initialize W&B Logger
+    wandb_logger = None
     if hparams["use_wandb"]:
         try:
-            import wandb
-            wandb_run = wandb.init(
+            # Import WandbLogger here to handle import errors gracefully
+            from pytorch_lightning.loggers import WandbLogger
+            
+            # Add scheduler info to config for W&B
+            wandb_config = hparams.copy()
+            wandb_config.update({
+                'effective_batch_size': hparams['batch_size'] * hparams['grad_accumulation_factor'],
+                'scheduler_info': 'Will be updated after dataset processing'
+            })
+            
+            wandb_logger = WandbLogger(
                 project=hparams["wandb_project"],
                 entity=hparams["wandb_entity"],
-                config=hparams,
                 name=f"nemo-arabic-{datetime.datetime.now().strftime('%Y%m%d-%H%M%S')}",
+                config=wandb_config,
+                log_model='all',  # Log model checkpoints
+                save_dir=hparams["output_folder"]
             )
-            logging.info(f"W&B initialized: {wandb_run.url}")
+            # WandbLogger will automatically log:
+            # - Training loss, validation loss
+            # - WER (Word Error Rate), CER (Character Error Rate)  
+            # - Learning rate, gradient norms
+            # - Model checkpoints and hyperparameters
+            logging.info(f"W&B Logger initialized: {wandb_logger.experiment.url}")
         except Exception as e:
-            logging.warning(f"W&B initialization failed: {e}")
+            logging.warning(f"W&B Logger initialization failed: {e}")
             hparams["use_wandb"] = False
+            wandb_logger = None
     
     try:
         # Import NeMo components
@@ -700,10 +751,11 @@ def train_nemo_arabic():
             'gradient_clip_val': hparams["max_grad_norm"],
             'accumulate_grad_batches': hparams["grad_accumulation_factor"],
             'log_every_n_steps': 50,
-            'val_check_interval': 0.5,
+            'val_check_interval': 1.0,  # Validate once per epoch for better stability
             'enable_checkpointing': True,
-            'logger': False,
+            'logger': wandb_logger if wandb_logger else False,
             'enable_progress_bar': True,
+            'check_val_every_n_epoch': 1,  # Ensure validation runs every epoch
         }
         
         # Add resume configuration if resuming
@@ -736,6 +788,10 @@ def train_nemo_arabic():
         validation_ds['batch_size'] = hparams['batch_size']
         validation_ds['shuffle'] = False
         validation_ds['num_workers'] = hparams['num_workers']
+        validation_ds['pin_memory'] = True
+        validation_ds['use_cer'] = True  # Enable CER calculation for validation
+        validation_ds['max_duration'] = 20.0  # Match training config
+        validation_ds['min_duration'] = 0.5   # Match training config
         
         # Test data config
         test_ds = {}
@@ -752,29 +808,241 @@ def train_nemo_arabic():
         model.setup_validation_data(val_data_config=validation_ds)
         model.setup_test_data(test_data_config=test_ds)
         
+        # Log validation configuration
+        logging.info("=" * 50)
+        logging.info("VALIDATION CONFIGURATION")
+        logging.info("=" * 50)
+        logging.info(f"Validation manifest: {val_manifest}")
+        logging.info(f"Validation batch size: {validation_ds['batch_size']}")
+        logging.info(f"Use CER for validation: {validation_ds.get('use_cer', False)}")
+        logging.info(f"Validation check interval: {trainer_config['val_check_interval']}")
+        logging.info(f"Model compute_eval_loss: {getattr(model, 'compute_eval_loss', 'Not set')}")
+        if hasattr(model, 'wer'):
+            logging.info(f"Model WER use_cer: {getattr(model.wer, 'use_cer', 'Not set')}")
+        logging.info("=" * 50)
+        
         # Set model to training mode
         model.train()
         
-        # Additional model configuration for evaluation
+        # Additional model configuration for evaluation and logging
         model.log_predictions = False
-        model.compute_eval_loss = False
+        model.compute_eval_loss = True  # Enable loss computation for logging
         
-        # Setup optimizer (following NeMo pattern)
-        optimizer_conf = {}
-        optimizer_conf['name'] = 'adamw'
-        optimizer_conf['lr'] = hparams["learning_rate"]
-        optimizer_conf['betas'] = [0.9, 0.98]
-        optimizer_conf['weight_decay'] = hparams["weight_decay"]
+        # Configure WER/CER metrics for validation
+        if hasattr(model, 'wer'):
+            model.wer.use_cer = True  # Enable CER calculation
+            model.wer.log_prediction = False  # Don't log predictions to save memory
+            logging.info("Configured model WER metric to use CER")
         
-        # Setup scheduler
-        sched = {}
-        sched['name'] = 'CosineAnnealing'
-        sched['warmup_steps'] = None
-        sched['warmup_ratio'] = 0.10
-        sched['min_lr'] = 1e-6
-        optimizer_conf['sched'] = sched
+        # Configure model logging for W&B
+        if wandb_logger:
+            # Enable detailed logging of training metrics
+            model.log_train_metrics = True
+            # Ensure validation metrics are logged
+            if hasattr(model, 'log_validation_metrics'):
+                model.log_validation_metrics = True
+            logging.info("Enabled detailed training and validation metrics logging for W&B")
+        
+        # Calculate scheduler parameters based on dataset size
+        if not skip_data_processing:
+            train_dataset_size = len(train_data)
+        else:
+            # Estimate dataset size from manifest file for resume cases
+            try:
+                with open(train_manifest, 'r') as f:
+                    train_dataset_size = sum(1 for line in f if line.strip())
+            except:
+                logging.warning("Could not determine dataset size from manifest, using default estimate")
+                train_dataset_size = 10000  # Conservative estimate
+        
+        total_steps, warmup_steps, steps_per_epoch = calculate_scheduler_steps(
+            dataset_size=train_dataset_size,
+            batch_size=hparams['batch_size'],
+            grad_accumulation=hparams['grad_accumulation_factor'],
+            epochs=hparams['epochs'],
+            debug_mode=hparams.get('debug_mode', False)
+        )
+        
+        # Log scheduler information
+        logging.info("=" * 50)
+        logging.info("SCHEDULER CONFIGURATION")
+        logging.info("=" * 50)
+        logging.info(f"Dataset size: {train_dataset_size}")
+        logging.info(f"Effective batch size: {hparams['batch_size'] * hparams['grad_accumulation_factor']}")
+        logging.info(f"Steps per epoch: {steps_per_epoch}")
+        logging.info(f"Total steps: {total_steps}")
+        logging.info(f"Warmup steps: {warmup_steps}")
+        logging.info(f"Learning rate: {hparams['learning_rate']}")
+        logging.info(f"Min learning rate: {hparams['min_lr']}")
+        logging.info("=" * 50)
+        
+        # Setup optimizer with NeMo's native pattern
+        optimizer_conf = {
+            'name': 'adamw',
+            'lr': hparams["learning_rate"],
+            'betas': [0.9, 0.98],
+            'weight_decay': hparams["weight_decay"],
+            'sched': {
+                'name': hparams["scheduler_name"],
+                'warmup_steps': warmup_steps,
+                'min_lr': hparams["min_lr"],
+                'max_steps': total_steps,
+            }
+        }
         
         model.setup_optimization(optimizer_conf)
+        
+        # Update W&B with scheduler information and additional metrics config
+        if wandb_logger:
+            try:
+                # Calculate additional metrics for logging
+                total_audio_hours = 0
+                avg_audio_duration = 0
+                if not skip_data_processing:
+                    total_audio_hours = sum(item['duration'] for item in train_data) / 3600
+                    avg_audio_duration = sum(item['duration'] for item in train_data) / len(train_data)
+                else:
+                    # Estimate from manifest if available
+                    try:
+                        with open(train_manifest, 'r') as f:
+                            durations = []
+                            for line in f:
+                                if line.strip():
+                                    data = json.loads(line)
+                                    durations.append(data.get('duration', 0))
+                            if durations:
+                                total_audio_hours = sum(durations) / 3600
+                                avg_audio_duration = sum(durations) / len(durations)
+                    except:
+                        pass
+                
+                wandb_logger.experiment.config.update({
+                    'total_steps': total_steps,
+                    'warmup_steps': warmup_steps,
+                    'steps_per_epoch': steps_per_epoch,
+                    'dataset_size': train_dataset_size,
+                    'scheduler_info': f"CosineAnnealing with {warmup_steps} warmup steps",
+                    # Additional dataset metrics
+                    'total_audio_hours': round(total_audio_hours, 2),
+                    'avg_audio_duration_sec': round(avg_audio_duration, 2),
+                    'augmentation_factor': hparams['num_augmented_variants'] + 1 if hparams['augment'] else 1,
+                    # Training efficiency metrics
+                    'samples_per_second': round(train_dataset_size / (hparams['epochs'] * steps_per_epoch * hparams['grad_accumulation_factor']), 2),
+                    'theoretical_training_time_hours': round((total_steps * hparams['grad_accumulation_factor']) / 3600, 2),
+                })
+                logging.info("Updated W&B config with scheduler and dataset information")
+            except Exception as e:
+                logging.warning(f"Failed to update W&B config: {e}")
+        
+        # Custom callback for additional metrics logging
+        class AdditionalMetricsCallback(pl.Callback):
+            def __init__(self):
+                super().__init__()
+                self.start_time = None
+                
+            def on_train_start(self, trainer, pl_module):
+                import time
+                self.start_time = time.time()
+                if trainer.logger:
+                    trainer.logger.log_metrics({
+                        'system/gpu_count': trainer.num_devices,
+                        'system/batch_size': hparams['batch_size'],
+                        'system/effective_batch_size': hparams['batch_size'] * hparams['grad_accumulation_factor'],
+                    })
+            
+            def on_train_epoch_end(self, trainer, pl_module):
+                if trainer.logger and self.start_time:
+                    import time
+                    elapsed_time = time.time() - self.start_time
+                    current_epoch = trainer.current_epoch + 1
+                    
+                    # Calculate training speed metrics
+                    samples_processed = current_epoch * steps_per_epoch * hparams['batch_size'] * hparams['grad_accumulation_factor']
+                    samples_per_second = samples_processed / elapsed_time if elapsed_time > 0 else 0
+                    
+                    trainer.logger.log_metrics({
+                        'performance/samples_per_second': samples_per_second,
+                        'performance/elapsed_time_hours': elapsed_time / 3600,
+                        'performance/samples_processed': samples_processed,
+                        'performance/epochs_per_hour': current_epoch / (elapsed_time / 3600) if elapsed_time > 0 else 0,
+                    }, step=trainer.global_step)
+            
+            def on_validation_epoch_end(self, trainer, pl_module):
+                if trainer.logger:
+                    # Log additional validation metrics if available
+                    try:
+                        # Get current learning rate
+                        current_lr = trainer.optimizers[0].param_groups[0]['lr']
+                        trainer.logger.log_metrics({
+                            'optimizer/learning_rate': current_lr,
+                            'training/current_epoch': trainer.current_epoch,
+                            'training/global_step': trainer.global_step,
+                        }, step=trainer.global_step)
+                        
+                        # Log GPU memory usage if available
+                        if torch.cuda.is_available():
+                            gpu_memory_allocated = torch.cuda.memory_allocated() / 1024**3  # GB
+                            gpu_memory_reserved = torch.cuda.memory_reserved() / 1024**3   # GB
+                            trainer.logger.log_metrics({
+                                'system/gpu_memory_allocated_gb': gpu_memory_allocated,
+                                'system/gpu_memory_reserved_gb': gpu_memory_reserved,
+                            }, step=trainer.global_step)
+                        
+                        # Log sample predictions every few epochs
+                        if hparams.get("log_predictions", False) and trainer.current_epoch % 2 == 0:
+                            self._log_sample_predictions(trainer, pl_module)
+                            
+                    except Exception as e:
+                        pass  # Don't fail training if metrics logging fails
+            
+            def _log_sample_predictions(self, trainer, pl_module):
+                """Log sample predictions to W&B for qualitative analysis."""
+                try:
+                    # Get a few samples from validation set
+                    val_dataloader = trainer.val_dataloaders[0] if trainer.val_dataloaders else None
+                    if val_dataloader and hasattr(trainer.logger, 'experiment'):
+                        import wandb
+                        
+                        # Get one batch for prediction logging
+                        batch = next(iter(val_dataloader))
+                        if len(batch) >= 3:  # audio, audio_len, targets
+                            audio_signal, audio_lengths, targets = batch[:3]
+                            
+                            # Move to device
+                            if torch.cuda.is_available():
+                                audio_signal = audio_signal.cuda()
+                                audio_lengths = audio_lengths.cuda()
+                            
+                            # Get predictions (first 3 samples only)
+                            with torch.no_grad():
+                                predictions = pl_module.transcribe(
+                                    audio=audio_signal[:3], 
+                                    audio_lengths=audio_lengths[:3]
+                                )
+                            
+                            # Create prediction table
+                            prediction_data = []
+                            for i, pred in enumerate(predictions[:3]):
+                                if i < len(targets):
+                                    target_text = "N/A"  # Would need tokenizer to decode
+                                    prediction_data.append([
+                                        f"Sample_{trainer.current_epoch}_{i}",
+                                        pred,
+                                        target_text,
+                                        len(pred.split()) if pred else 0
+                                    ])
+                            
+                            # Log to W&B
+                            table = wandb.Table(
+                                columns=["Sample_ID", "Prediction", "Target", "Word_Count"],
+                                data=prediction_data
+                            )
+                            trainer.logger.experiment.log({
+                                f"predictions/epoch_{trainer.current_epoch}": table
+                            }, step=trainer.global_step)
+                            
+                except Exception as e:
+                    logging.warning(f"Failed to log sample predictions: {e}")
         
         # Setup callbacks
         checkpoint_callback = ModelCheckpoint(
@@ -792,14 +1060,24 @@ def train_nemo_arabic():
             mode='min',
         )
         
-        callbacks = [checkpoint_callback, early_stopping]
+        # Add custom metrics callback
+        additional_metrics_callback = AdditionalMetricsCallback()
+        
+        callbacks = [checkpoint_callback, early_stopping, additional_metrics_callback]
         trainer_config['callbacks'] = callbacks
         
         # Create trainer and set it on the model
         trainer = pl.Trainer(**trainer_config)
         model.set_trainer(trainer)
         
+        # Final validation before training
+        if warmup_steps >= total_steps:
+            logging.warning(f"Warmup steps ({warmup_steps}) >= total steps ({total_steps}). Adjusting warmup.")
+            warmup_steps = max(1, total_steps // 4)  # Use 25% as fallback
+            logging.info(f"Adjusted warmup steps to: {warmup_steps}")
+        
         logging.info("Starting training...")
+        logging.info(f"Final scheduler config: warmup={warmup_steps}, total={total_steps}, lr={hparams['learning_rate']}")
         if resume_checkpoint_path:
             logging.info(f"Resuming training from checkpoint: {resume_checkpoint_path}")
         else:
@@ -833,8 +1111,14 @@ def train_nemo_arabic():
         raise
     
     finally:
-        if wandb_run:
-            wandb.finish()
+        # W&B cleanup is handled automatically by PyTorch Lightning WandbLogger
+        # but we can explicitly finalize if needed
+        if wandb_logger:
+            try:
+                wandb_logger.finalize("success")
+                logging.info("W&B logging finalized successfully")
+            except Exception as e:
+                logging.warning(f"W&B finalization warning: {e}")
 
 @app.local_entrypoint()
 def main():
