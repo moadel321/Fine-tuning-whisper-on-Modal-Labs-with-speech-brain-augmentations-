@@ -123,9 +123,9 @@ hparams = {
     "epochs": 10,
     "learning_rate": 2e-5,  # Reduced from 1e-4 for stable fine-tuning
     "weight_decay": 0.005,  # Reduced from 0.01 for fine-tuning
-    "batch_size": 8,
-    "num_workers": 8,
-    "grad_accumulation_factor": 4,
+    "batch_size": 32,
+    "num_workers": 16,
+    "grad_accumulation_factor": 2,
     "max_grad_norm": 5.0,
     
     # Scheduler parameters
